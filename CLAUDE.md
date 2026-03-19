@@ -76,6 +76,48 @@ Environment override: `APP_SERVER__GRPC_PORT=50052` etc.
 ## Key Implementation Details
 
 - Vector IDs are internal (0-indexed, auto-incremented); user-provided IDs in upsert are currently ignored
-- Search supports two filtering modes: pre-filter via `filter_ids` (RoaringBitmap) and post-filter via metadata `filter`
+- Search supports two filtering modes: pre-filter via `filter_ids` or `filter_id_range` (RoaringBitmap) and post-filter via metadata `filter`
 - Post-filtering uses Rayon for parallel metadata lookups
 - Index is saved on graceful shutdown (SIGINT/SIGTERM)
+
+## Performance Optimizations
+
+### Storage Layer
+- **Write Buffer**: Batches 256 vectors before flushing to disk (reduces fsync overhead)
+- **parking_lot locks**: Uses `parking_lot::Mutex` and `RwLock` instead of std for better contention handling
+- **Atomic counters**: Lock-free vector count tracking via `AtomicUsize`
+- **Mmap optimization**: Tracks mmap length atomically, auto-refreshes after flush
+
+### Metadata Layer
+- **LRU Cache**: 10,000 entry cache for metadata lookups (32x speedup on cache hit)
+- **Write-through policy**: Cache updated on insert
+
+### ID Filtering
+- **`filter_ids`**: Uses `from_sorted_iter` for O(n) bitmap creation
+- **`filter_id_range`**: Uses `insert_range` for O(1) contiguous range filters
+
+## Performance Benchmarks
+
+Tested with 128-dimensional vectors on Apple Silicon.
+
+### Throughput (20 concurrent threads)
+| Operation | ops/sec | Avg Latency |
+|-----------|---------|-------------|
+| GET | 5,589 | 3.44ms |
+| Search+Filter | 3,691 | 4.99ms |
+| Search | 3,337 | 5.58ms |
+| Upsert | 1,791 | 10.63ms |
+
+### Mixed Workload (90% read, 10% write)
+| Threads | Throughput |
+|---------|------------|
+| 10 | 3,252 ops/s |
+| 20 | 3,606 ops/s |
+| 50 | 3,287 ops/s |
+
+### Sequential Operations
+| Operation | Latency | Throughput |
+|-----------|---------|------------|
+| GET | 0.36ms | 2,812/s |
+| Search | 0.78ms | 1,275/s |
+| Upsert | 1.69ms | 593/s |
