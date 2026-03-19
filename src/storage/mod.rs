@@ -1,11 +1,13 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Write, Seek, SeekFrom};
+use std::num::NonZeroUsize;
 use memmap2::Mmap;
 use parking_lot::{RwLock, Mutex};
 use sled::Db;
 use anyhow::Result;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
+use lru::LruCache;
 
 /// Trait for storing vectors
 pub trait VectorStore: Send + Sync {
@@ -27,11 +29,11 @@ const FLUSH_THRESHOLD_BYTES: usize = 256 * 1024; // Or 256KB
 pub struct MemmapVectorStore {
     file: Mutex<File>,              // Mutex for write-heavy workload
     mmap: RwLock<Option<Mmap>>,     // parking_lot RwLock
+    mmap_len: AtomicUsize,          // Track current mmap length
     dim: usize,
     count: AtomicUsize,             // Atomic for lock-free reads
     write_buffer: Mutex<WriteBuffer>,
     flushing: AtomicUsize,          // Flag to track if flush is in progress
-    path: String,
 }
 
 struct WriteBuffer {
@@ -48,14 +50,10 @@ impl MemmapVectorStore {
             .open(path)?;
 
         let meta = file.metadata()?;
-        let len = meta.len();
+        let len = meta.len() as usize;
         let vec_size = dim * size_of::<f32>();
 
-        let count = if len > 0 {
-            (len as usize) / vec_size
-        } else {
-            0
-        };
+        let count = if len > 0 { len / vec_size } else { 0 };
 
         let mmap = if len > 0 {
             unsafe { Some(Mmap::map(&file)?) }
@@ -66,6 +64,7 @@ impl MemmapVectorStore {
         Ok(Self {
             file: Mutex::new(file),
             mmap: RwLock::new(mmap),
+            mmap_len: AtomicUsize::new(len),
             dim,
             count: AtomicUsize::new(count),
             write_buffer: Mutex::new(WriteBuffer {
@@ -73,18 +72,26 @@ impl MemmapVectorStore {
                 pending_count: 0,
             }),
             flushing: AtomicUsize::new(0),
-            path: path.to_string(),
         })
     }
 
-    fn refresh_mmap(&self) -> Result<()> {
-        let file = self.file.lock();
-        if file.metadata()?.len() == 0 {
-            return Ok(());
+    fn refresh_mmap_if_needed(&self, needed_len: usize) -> Result<bool> {
+        let current_len = self.mmap_len.load(Ordering::Acquire);
+        if current_len >= needed_len {
+            return Ok(false); // No refresh needed
         }
+
+        let file = self.file.lock();
+        let file_len = file.metadata()?.len() as usize;
+        if file_len == 0 {
+            return Ok(false);
+        }
+
         let mmap = unsafe { Mmap::map(&*file)? };
+        let new_len = mmap.len();
         *self.mmap.write() = Some(mmap);
-        Ok(())
+        self.mmap_len.store(new_len, Ordering::Release);
+        Ok(true)
     }
 
     fn flush_buffer_internal(&self, buffer: &mut WriteBuffer) -> Result<()> {
@@ -92,13 +99,22 @@ impl MemmapVectorStore {
             return Ok(());
         }
 
-        let mut file = self.file.lock();
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(&buffer.data)?;
-        file.flush()?;
+        let new_data_len = buffer.data.len();
+
+        {
+            let mut file = self.file.lock();
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(&buffer.data)?;
+            file.flush()?;
+        }
 
         buffer.data.clear();
         buffer.pending_count = 0;
+
+        // Auto-refresh mmap after flush for better read performance
+        let current_len = self.mmap_len.load(Ordering::Acquire);
+        let _ = self.refresh_mmap_if_needed(current_len + new_data_len);
+
         Ok(())
     }
 }
@@ -178,30 +194,29 @@ impl VectorStore for MemmapVectorStore {
             }
         }
 
-        // Try optimistic read from mmap
-        {
+        // Fast path: check if mmap is large enough using atomic
+        let mmap_len = self.mmap_len.load(Ordering::Acquire);
+        if mmap_len >= needed_len {
             let mmap_guard = self.mmap.read();
             if let Some(ref mmap) = *mmap_guard {
-                if mmap.len() >= needed_len {
-                    let start = id_usize * vec_size;
-                    let end = start + vec_size;
-                    let bytes = &mmap[start..end];
+                let start = id_usize * vec_size;
+                let end = start + vec_size;
+                let bytes = &mmap[start..end];
 
-                    let mut vector = vec![0.0f32; self.dim];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            bytes.as_ptr(),
-                            vector.as_mut_ptr() as *mut u8,
-                            bytes.len(),
-                        );
-                    }
-                    return Ok(vector);
+                let mut vector = vec![0.0f32; self.dim];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        vector.as_mut_ptr() as *mut u8,
+                        bytes.len(),
+                    );
                 }
+                return Ok(vector);
             }
         }
 
-        // Mmap is stale, refresh it
-        self.refresh_mmap()?;
+        // Mmap is stale, refresh it if needed
+        self.refresh_mmap_if_needed(needed_len)?;
 
         let mmap_guard = self.mmap.read();
         if let Some(ref mmap) = *mmap_guard {
@@ -234,30 +249,76 @@ impl VectorStore for MemmapVectorStore {
     }
 }
 
+const METADATA_CACHE_SIZE: usize = 10_000;
+
 pub struct SledMetadataStore {
     db: Db,
+    cache: Mutex<LruCache<String, Option<String>>>,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
 }
 
 impl SledMetadataStore {
     pub fn new(path: &str) -> Result<Self> {
         let db = sled::open(path)?;
-        Ok(Self { db })
+        let cache = LruCache::new(NonZeroUsize::new(METADATA_CACHE_SIZE).unwrap());
+        Ok(Self {
+            db,
+            cache: Mutex::new(cache),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+        })
+    }
+
+    pub fn cache_stats(&self) -> (u64, u64) {
+        (
+            self.cache_hits.load(Ordering::Relaxed),
+            self.cache_misses.load(Ordering::Relaxed),
+        )
     }
 }
 
 impl MetadataStore for SledMetadataStore {
     fn insert(&self, id: u64, key: String, value: String) -> Result<()> {
         let k = format!("{}:{}", id, key);
+
+        // Update cache
+        {
+            let mut cache = self.cache.lock();
+            cache.put(k.clone(), Some(value.clone()));
+        }
+
+        // Write to DB
         self.db.insert(k.as_bytes(), value.as_bytes())?;
         Ok(())
     }
 
     fn get(&self, id: u64, key: &str) -> Result<Option<String>> {
         let k = format!("{}:{}", id, key);
-        if let Some(v) = self.db.get(k.as_bytes())? {
-            Ok(Some(String::from_utf8(v.to_vec())?))
-        } else {
-            Ok(None)
+
+        // Check cache first
+        {
+            let mut cache = self.cache.lock();
+            if let Some(cached) = cache.get(&k) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(cached.clone());
+            }
         }
+
+        // Cache miss - read from DB
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        let result = if let Some(v) = self.db.get(k.as_bytes())? {
+            Some(String::from_utf8(v.to_vec())?)
+        } else {
+            None
+        };
+
+        // Update cache
+        {
+            let mut cache = self.cache.lock();
+            cache.put(k, result.clone());
+        }
+
+        Ok(result)
     }
 }

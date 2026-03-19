@@ -38,6 +38,7 @@ thiserror = "1.0"
 parking_lot = "0.12"
 rayon = "1.8"
 config = "0.13"
+lru = "0.12"
 
 [build-dependencies]
 tonic-build = "0.11"
