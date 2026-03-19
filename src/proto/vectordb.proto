@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package vectordb;
+
+service VectorService {
+  rpc Upsert (UpsertRequest) returns (UpsertResponse);
+  rpc Search (SearchRequest) returns (SearchResponse);
+  rpc Get (GetRequest) returns (GetResponse);
+}
+
+message Vector {
+  repeated float elements = 1;
+}
+
+message UpsertRequest {
+  uint64 id = 1; // Explicit ID for now, or could be auto-generated
+  Vector vector = 2;
+  map<string, string> metadata = 3;
+}
+
+message UpsertResponse {
+  uint64 id = 1;
+  bool success = 2;
+}
+
+message SearchRequest {
+  Vector vector = 1;
+  uint32 k = 2; // Number of neighbors
+  map<string, string> filter = 3; // Exact match filter for MVP
+  repeated uint64 filter_ids = 4; // List of allowed IDs
+}
+
+message SearchResult {
+  uint64 id = 1;
+  float score = 2;
+}
+
+message SearchResponse {
+  repeated SearchResult results = 1;
+}
+
+message GetRequest {
+  uint64 id = 1;
+}
+
+message GetResponse {
+  Vector vector = 1;
+  map<string, string> metadata = 2;
+  bool found = 3;
+}

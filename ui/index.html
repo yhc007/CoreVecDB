@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vector DB Console</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+
+<body class="dark-theme">
+    <div class="app-layout">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="logo">
+                <i data-lucide="database"></i>
+                <span>VectorDB</span>
+            </div>
+            <nav>
+                <a href="#" class="nav-item active" onclick="switchView('dashboard', this)"><i
+                        data-lucide="layout-dashboard"></i> Dashboard</a>
+                <a href="#" class="nav-item" onclick="switchView('settings', this)"><i data-lucide="settings"></i>
+                    Settings</a>
+            </nav>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header class="top-bar">
+                <h1>Overview</h1>
+                <div class="status-badge" id="conn-status">
+                    <span class="dot"></span> Connected
+                </div>
+            </header>
+
+            <!-- Results -->
+            <div id="view-dashboard" class="view-section">
+                <!-- Stats Grid -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon"><i data-lucide="layers"></i></div>
+                        <div class="stat-content">
+                            <h3>Total Vectors</h3>
+                            <p id="stat-count">-</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i data-lucide="maximize"></i></div>
+                        <div class="stat-content">
+                            <h3>Dimensions</h3>
+                            <p id="stat-dim">-</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon"><i data-lucide="activity"></i></div>
+                        <div class="stat-content">
+                            <h3>Status</h3>
+                            <p id="stat-status">Check</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Search Console -->
+                <div class="console-section">
+                    <h2>Vector Search</h2>
+                    <div class="search-box">
+                        <textarea id="search-vector"
+                            placeholder="Enter vector [0.1, 0.2, ...] (JSON Array) or leave empty for random"></textarea>
+                        <div class="actions">
+                            <button onclick="performSearch()" class="btn-primary">
+                                <i data-lucide="search"></i> Search
+                            </button>
+                            <button onclick="generateRandomVector()" class="btn-secondary">
+                                <i data-lucide="shuffle"></i> Random Vector
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="results-section">
+                    <h2>Results</h2>
+                    <div id="results-container" class="results-grid">
+                        <!-- Result items will be injected here -->
+                        <div class="empty-state">Perform a search to see results</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings View -->
+            <div id="view-settings" class="view-section" style="display: none;">
+                <h2>Settings</h2>
+                <div class="console-section">
+                    <h3>Connection</h3>
+                    <div class="search-box" style="padding: 24px;">
+                        <label style="display: block; margin-bottom: 10px; color: var(--text-secondary);">Backend API
+                            URL</label>
+                        <input type="text" id="api-url-input" placeholder="http://localhost:3000"
+                            style="width: 100%; padding: 12px; background: #0f172a; border: 1px solid var(--border); color: var(--text-primary); border-radius: 8px; margin-bottom: 20px;">
+
+                        <button onclick="saveSettings()" class="btn-primary">
+                            <i data-lucide="save"></i> Save & Connect
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="app.js"></script>
+    <script>
+        lucide.createIcons();
+    </script>
+</body>
+
+</html>
