@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use vectordb::api::VectorServiceImpl;
 use vectordb::index::{HnswIndexer, DistanceMetric};
-use vectordb::storage::{MemmapVectorStore, SledMetadataStore, VectorStore};
+use vectordb::storage::{MemmapVectorStore, QuantizedMemmapVectorStore, SledMetadataStore, VectorStore};
 use vectordb::proto::vectordb::vector_service_server::VectorServiceServer;
 use std::path::Path;
 use std::fs;
@@ -21,13 +21,24 @@ async fn main() -> Result<()> {
     let data_dir = &config.server.data_dir;
     fs::create_dir_all(data_dir)?;
 
-    let vector_path = format!("{}/vectors.bin", data_dir);
+    let vector_path = format!("{}/vectors", data_dir);
     let index_path = format!("{}/index.hnsw", data_dir);
     let meta_path = format!("{}/meta.sled", data_dir);
 
-    // 1. Storage
-    let dim = config.index.dim; 
-    let vector_store = Arc::new(MemmapVectorStore::new(&vector_path, dim)?);
+    // 1. Storage - use quantized or regular based on config
+    let dim = config.index.dim;
+    let vector_store: Arc<dyn VectorStore> = if config.quantization.enabled {
+        println!("Using QUANTIZED storage (75% memory savings)");
+        println!("  - Keep originals for reranking: {}", config.quantization.keep_originals);
+        Arc::new(QuantizedMemmapVectorStore::new(
+            &vector_path,
+            dim,
+            config.quantization.keep_originals,
+        )?)
+    } else {
+        println!("Using standard float32 storage");
+        Arc::new(MemmapVectorStore::new(&format!("{}.bin", vector_path), dim)?)
+    };
     let metadata_store = Arc::new(SledMetadataStore::new(&meta_path)?);
 
     // 2. Index

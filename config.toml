@@ -8,3 +8,8 @@ dim = 128
 max_elements = 10000
 m = 24
 ef_construction = 400
+
+[quantization]
+enabled = true
+keep_originals = false
+rerank_oversample = 3

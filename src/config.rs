@@ -5,6 +5,7 @@ use config::{Config, ConfigError, File, Environment};
 pub struct AppConfig {
     pub server: ServerConfig,
     pub index: IndexConfig,
+    pub quantization: QuantizationConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -22,6 +23,16 @@ pub struct IndexConfig {
     pub ef_construction: usize,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct QuantizationConfig {
+    /// Enable scalar quantization (float32 -> uint8)
+    pub enabled: bool,
+    /// Keep original vectors for reranking
+    pub keep_originals: bool,
+    /// Oversample factor for reranking (e.g., 3 means fetch 3x candidates)
+    pub rerank_oversample: usize,
+}
+
 impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
         let builder = Config::builder()
@@ -33,6 +44,9 @@ impl AppConfig {
             .set_default("index.max_elements", 10000)?
             .set_default("index.m", 24)?
             .set_default("index.ef_construction", 400)?
+            .set_default("quantization.enabled", false)?
+            .set_default("quantization.keep_originals", true)?
+            .set_default("quantization.rerank_oversample", 3)?
             // Load from config file (optional)
             .add_source(File::with_name("config").required(false))
             // Load from environment variables (e.g. APP_SERVER__GRPC_PORT=50052)
