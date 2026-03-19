@@ -4,10 +4,8 @@ use axum::{
     http::StatusCode,
 };
 use std::sync::Arc;
-use crate::api::VectorServiceImpl;
-use crate::proto::vectordb::{UpsertRequest, SearchRequest, GetRequest};
+use crate::api::{VectorServiceImpl, create_filter_bitmap, create_range_bitmap};
 use serde::{Deserialize, Serialize};
-use roaring::RoaringBitmap;
 
 // Wrapper structs for JSON compatibility if proto structs don't behave well with Serde automatically
 // (Prost types usually need ::serde feature or separate structs if we want clean JSON)
@@ -29,6 +27,8 @@ pub struct JsonSearchReq {
     k: u32,
     filter: std::collections::HashMap<String, String>,
     filter_ids: Option<Vec<u64>>,
+    /// Range filter: [start, end] inclusive. More efficient than listing all IDs.
+    filter_id_range: Option<(u64, u64)>,
 }
 
 #[derive(Serialize)]
@@ -101,13 +101,17 @@ async fn search(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<JsonSearchReq>,
 ) -> Result<Json<JsonSearchResp>, StatusCode> {
-    
-    let filter_bitmap = if let Some(ids) = payload.filter_ids {
-         let mut rb = RoaringBitmap::new();
-         for id in ids {
-             rb.insert(id as u32);
-         }
-         Some(rb)
+
+    // Build filter bitmap efficiently
+    let filter_bitmap = if let Some((start, end)) = payload.filter_id_range {
+        // Range filter is most efficient for contiguous IDs
+        Some(create_range_bitmap(start, end))
+    } else if let Some(ref ids) = payload.filter_ids {
+        if !ids.is_empty() {
+            Some(create_filter_bitmap(ids))
+        } else {
+            None
+        }
     } else {
         None
     };

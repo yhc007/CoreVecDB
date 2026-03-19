@@ -8,6 +8,31 @@ use roaring::RoaringBitmap;
 
 pub mod http;
 
+/// Efficiently create a RoaringBitmap from a list of u64 IDs.
+/// Uses sorted iterator for optimal performance.
+#[inline]
+pub fn create_filter_bitmap(ids: &[u64]) -> RoaringBitmap {
+    if ids.is_empty() {
+        return RoaringBitmap::new();
+    }
+
+    // Convert to u32 and sort for optimal bitmap creation
+    let mut ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+    ids_u32.sort_unstable();
+
+    // from_sorted_iter is much faster than individual inserts
+    RoaringBitmap::from_sorted_iter(ids_u32.into_iter()).unwrap_or_default()
+}
+
+/// Create a RoaringBitmap from a range of IDs (inclusive).
+/// Very efficient for contiguous ID ranges.
+#[inline]
+pub fn create_range_bitmap(start: u64, end: u64) -> RoaringBitmap {
+    let mut rb = RoaringBitmap::new();
+    rb.insert_range(start as u32..=end as u32);
+    rb
+}
+
 #[derive(Clone)]
 pub struct VectorServiceImpl {
     pub vector_store: Arc<dyn VectorStore>,
@@ -81,14 +106,9 @@ impl VectorService for VectorServiceImpl {
         
         if let Some(vec) = req.vector {
             let filter_bitmap = if !req.filter_ids.is_empty() {
-                 let mut rb = RoaringBitmap::new();
-                 // Optimize by creating from sorted iter if possible, or just insert
-                 for id in req.filter_ids {
-                     rb.insert(id as u32);
-                 }
-                 Some(rb)
+                Some(create_filter_bitmap(&req.filter_ids))
             } else {
-                 None
+                None
             };
             
             let results = self.indexer.search(&vec.elements, k, filter_bitmap.as_ref())
