@@ -53,12 +53,18 @@ VectorDB is a Rust-based vector database with HNSW indexing, exposing both gRPC 
    - Pre-filtering in HNSW search for indexed fields
    - Automatic fallback to post-filtering for non-indexed fields
 
-5. **API** (`src/api/`)
-   - `mod.rs`: gRPC service implementation (`VectorServiceImpl`)
-   - `http.rs`: Axum HTTP handlers mirroring gRPC functionality
-   - Both share the same underlying service logic
+5. **Collection** (`src/collection/mod.rs`)
+   - `Collection`: Independent vector space with its own storage, index, and metadata
+   - `CollectionManager`: Manages multiple collections (create, delete, list)
+   - `CollectionConfig`: Per-collection settings (dim, distance, quantization, indexed_fields)
+   - Each collection stored in `data/<collection_name>/` directory
 
-6. **Proto** (`src/proto/vectordb.proto`)
+6. **API** (`src/api/`)
+   - `mod.rs`: gRPC service implementation (`VectorServiceImpl`)
+   - `http.rs`: Axum HTTP handlers with multi-collection support
+   - Legacy endpoints use "default" collection for backward compatibility
+
+7. **Proto** (`src/proto/vectordb.proto`)
    - Defines `VectorService` with `Upsert`, `Search`, `Get` RPCs
    - Compiled via `tonic-build` in `build.rs`
 
@@ -84,11 +90,24 @@ Environment override: `APP_SERVER__GRPC_PORT=50052` etc.
 
 ## HTTP API Endpoints
 
+### Collection Management
+- `GET /collections` - List all collections
+- `POST /collections` - Create new collection
+- `GET /collections/:name` - Get collection info
+- `DELETE /collections/:name` - Delete collection
+
+### Vector Operations (with collection)
+- `POST /collections/:name/upsert` - Insert vector
+- `POST /collections/:name/search` - Search vectors
+- `GET /collections/:name/vectors/:id` - Get vector by ID
+
+### Legacy Endpoints (uses "default" collection)
 - `POST /upsert` - Insert vector with metadata
 - `POST /search` - k-NN search with optional metadata/ID filtering
 - `GET /vectors/:id` - Retrieve vector by ID
 - `GET /stats` - Get vector count and status
-- Static files served from `ui/` directory at root
+
+Static files served from `ui/` directory at root
 
 ## Key Implementation Details
 
@@ -219,6 +238,74 @@ FilterQuery::not(FilterQuery::eq("status", "deleted"))
 - **Pattern matching**: FilterQuery enum dispatch
 - **Closures**: Lazy evaluation in bitmap operations
 - **Option/Result monads**: Safe error handling
+
+## Multi-Collection
+
+Each collection is an independent vector space with its own storage, index, and configuration.
+
+### Create Collection
+```bash
+curl -X POST http://localhost:3000/collections \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "products",
+    "dim": 128,
+    "distance": "euclidean",
+    "quantization_enabled": false,
+    "indexed_fields": ["category", "brand"],
+    "numeric_fields": ["price", "rating"]
+  }'
+```
+
+### Collection Operations
+```bash
+# List all collections
+curl http://localhost:3000/collections
+
+# Get collection info
+curl http://localhost:3000/collections/products
+
+# Delete collection
+curl -X DELETE http://localhost:3000/collections/products
+```
+
+### Vector Operations with Collection
+```bash
+# Upsert to specific collection
+curl -X POST http://localhost:3000/collections/products/upsert \
+  -d '{"vector": [...], "metadata": {"category": "electronics"}}'
+
+# Search in specific collection
+curl -X POST http://localhost:3000/collections/products/search \
+  -d '{"vector": [...], "k": 10, "filter": {"category": "electronics"}}'
+
+# Get vector from collection
+curl http://localhost:3000/collections/products/vectors/0
+```
+
+### Directory Structure
+```
+data/
+├── products/           # "products" collection
+│   ├── config.json     # Collection configuration
+│   ├── vectors.bin     # Vector storage
+│   ├── index.hnsw.*    # HNSW index files
+│   └── meta.sled/      # Metadata store
+├── users/              # "users" collection
+│   └── ...
+└── default/            # Default collection (legacy endpoints)
+    └── ...
+```
+
+### Collection Config Options
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | required | Collection name |
+| `dim` | int | required | Vector dimension |
+| `distance` | string | "euclidean" | Distance metric (euclidean, cosine) |
+| `quantization_enabled` | bool | false | Enable scalar quantization |
+| `indexed_fields` | string[] | [] | String fields for exact match filtering |
+| `numeric_fields` | string[] | [] | Numeric fields for range queries |
 
 ## Performance Benchmarks
 
