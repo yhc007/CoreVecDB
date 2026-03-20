@@ -7,6 +7,7 @@
 //! - Configuration (dimension, index params, etc.)
 
 use anyhow::{Result, Context};
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ use crate::storage::{
     MemmapVectorStore, QuantizedMemmapVectorStore, SledMetadataStore,
     IndexedSledMetadataStore, VectorStore, MetadataStore,
 };
+use roaring::RoaringBitmap;
 
 /// Collection configuration stored on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +153,8 @@ pub struct Collection {
     pub indexer: Arc<HnswIndexer>,
     /// Base path for this collection
     base_path: PathBuf,
+    /// Deleted vector IDs (soft delete tombstones)
+    deleted_ids: RwLock<RoaringBitmap>,
 }
 
 impl Collection {
@@ -162,6 +166,7 @@ impl Collection {
         let vector_path = base_path.join("vectors");
         let index_path = base_path.join("index.hnsw");
         let meta_path = base_path.join("meta.sled");
+        let deleted_path = base_path.join("deleted.bin");
 
         // Save config if new, or load existing
         let config = if config_path.exists() {
@@ -215,12 +220,22 @@ impl Collection {
             ))
         };
 
+        // Load deleted IDs if exists
+        let deleted_ids = if deleted_path.exists() {
+            let bytes = fs::read(&deleted_path)?;
+            RoaringBitmap::deserialize_from(&bytes[..])
+                .unwrap_or_else(|_| RoaringBitmap::new())
+        } else {
+            RoaringBitmap::new()
+        };
+
         Ok(Self {
             config,
             vector_store,
             metadata_store,
             indexer,
             base_path: base_path.to_path_buf(),
+            deleted_ids: RwLock::new(deleted_ids),
         })
     }
 
@@ -229,19 +244,88 @@ impl Collection {
         &self.config.name
     }
 
-    /// Get vector count.
+    /// Get total vector count (including deleted).
     pub fn len(&self) -> usize {
         self.vector_store.len()
     }
 
+    /// Get active vector count (excluding deleted).
+    pub fn active_count(&self) -> usize {
+        let total = self.vector_store.len();
+        let deleted = self.deleted_ids.read().len() as usize;
+        total.saturating_sub(deleted)
+    }
+
+    /// Get deleted vector count.
+    pub fn deleted_count(&self) -> usize {
+        self.deleted_ids.read().len() as usize
+    }
+
     /// Check if empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.active_count() == 0
+    }
+
+    /// Check if a vector is deleted.
+    pub fn is_deleted(&self, id: u64) -> bool {
+        self.deleted_ids.read().contains(id as u32)
+    }
+
+    /// Delete a vector by ID (soft delete).
+    /// Returns true if the vector was deleted, false if already deleted or not found.
+    pub fn delete(&self, id: u64) -> Result<bool> {
+        let total = self.vector_store.len();
+        if id as usize >= total {
+            return Err(anyhow::anyhow!("Vector ID {} out of bounds", id));
+        }
+
+        let mut deleted = self.deleted_ids.write();
+        if deleted.contains(id as u32) {
+            return Ok(false); // Already deleted
+        }
+
+        deleted.insert(id as u32);
+        Ok(true)
+    }
+
+    /// Delete multiple vectors by ID.
+    /// Returns the number of vectors actually deleted.
+    pub fn delete_batch(&self, ids: &[u64]) -> Result<usize> {
+        let total = self.vector_store.len();
+        let mut deleted = self.deleted_ids.write();
+        let mut count = 0;
+
+        for &id in ids {
+            if (id as usize) < total && !deleted.contains(id as u32) {
+                deleted.insert(id as u32);
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Get the deleted IDs bitmap for search filtering.
+    pub fn deleted_bitmap(&self) -> RoaringBitmap {
+        self.deleted_ids.read().clone()
     }
 
     /// Flush all data to disk.
     pub fn flush(&self) -> Result<()> {
         self.vector_store.flush()?;
+
+        // Save deleted IDs
+        let deleted_path = self.base_path.join("deleted.bin");
+        let deleted = self.deleted_ids.read();
+        if !deleted.is_empty() {
+            let mut bytes = Vec::new();
+            deleted.serialize_into(&mut bytes)?;
+            fs::write(deleted_path, bytes)?;
+        } else if deleted_path.exists() {
+            // Remove file if no deleted IDs
+            let _ = fs::remove_file(deleted_path);
+        }
+
         Ok(())
     }
 
@@ -257,13 +341,91 @@ impl Collection {
         CollectionInfo {
             name: self.config.name.clone(),
             dim: self.config.dim,
-            vector_count: self.len(),
+            vector_count: self.active_count(),
+            deleted_count: self.deleted_count(),
             distance_metric: self.config.distance.metric.clone(),
             quantization_enabled: self.config.quantization.enabled,
             indexed_fields: self.config.payload.indexed_fields.clone(),
             numeric_fields: self.config.payload.numeric_fields.clone(),
         }
     }
+
+    /// Get base path for this collection.
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
+    }
+
+    /// Create a snapshot of this collection.
+    /// Copies all files to the snapshot directory.
+    pub fn create_snapshot(&self, snapshot_path: &Path) -> Result<SnapshotInfo> {
+        // Ensure data is flushed before snapshot
+        self.flush()?;
+        self.save_index()?;
+
+        // Create snapshot directory
+        fs::create_dir_all(snapshot_path)?;
+
+        // Copy all files recursively
+        copy_dir_recursive(&self.base_path, snapshot_path)?;
+
+        // Create snapshot metadata
+        let info = SnapshotInfo {
+            name: snapshot_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            collection: self.config.name.clone(),
+            created_at: Utc::now(),
+            vector_count: self.len(),
+            size_bytes: dir_size(snapshot_path)?,
+        };
+
+        // Save snapshot metadata
+        let meta_path = snapshot_path.join("snapshot.json");
+        let meta_content = serde_json::to_string_pretty(&info)?;
+        fs::write(meta_path, meta_content)?;
+
+        Ok(info)
+    }
+}
+
+/// Recursively copy directory contents.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    if !dst.exists() {
+        fs::create_dir_all(dst)?;
+    }
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Calculate directory size in bytes.
+fn dir_size(path: &Path) -> Result<u64> {
+    let mut size = 0;
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                size += dir_size(&path)?;
+            } else {
+                size += entry.metadata()?.len();
+            }
+        }
+    }
+    Ok(size)
 }
 
 /// Collection information for API responses.
@@ -272,10 +434,21 @@ pub struct CollectionInfo {
     pub name: String,
     pub dim: usize,
     pub vector_count: usize,
+    pub deleted_count: usize,
     pub distance_metric: String,
     pub quantization_enabled: bool,
     pub indexed_fields: Vec<String>,
     pub numeric_fields: Vec<String>,
+}
+
+/// Snapshot information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    pub name: String,
+    pub collection: String,
+    pub created_at: DateTime<Utc>,
+    pub vector_count: usize,
+    pub size_bytes: u64,
 }
 
 /// Manager for multiple collections.
@@ -440,6 +613,138 @@ impl CollectionManager {
                 println!("Saved index for collection: {}", name);
             }
         }
+        Ok(())
+    }
+
+    /// Get snapshots directory.
+    pub fn snapshots_dir(&self) -> PathBuf {
+        self.base_dir.join("_snapshots")
+    }
+
+    /// Create a snapshot of a collection.
+    /// Returns snapshot info with timestamp-based name.
+    pub fn create_snapshot(&self, collection_name: &str) -> Result<SnapshotInfo> {
+        let collection = self.get(collection_name)
+            .ok_or_else(|| anyhow::anyhow!("Collection '{}' not found", collection_name))?;
+
+        // Create snapshot directory with timestamp
+        let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        let snapshot_name = format!("{}_{}", collection_name, timestamp);
+        let snapshot_dir = self.snapshots_dir().join(&snapshot_name);
+
+        let info = collection.create_snapshot(&snapshot_dir)?;
+        println!("Created snapshot: {} ({} bytes)", snapshot_name, info.size_bytes);
+
+        Ok(info)
+    }
+
+    /// List all snapshots for a collection.
+    pub fn list_snapshots(&self, collection_name: &str) -> Result<Vec<SnapshotInfo>> {
+        let snapshots_dir = self.snapshots_dir();
+        if !snapshots_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let prefix = format!("{}_", collection_name);
+        let mut snapshots = Vec::new();
+
+        for entry in fs::read_dir(&snapshots_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                let name = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+
+                if name.starts_with(&prefix) {
+                    // Try to load snapshot metadata
+                    let meta_path = path.join("snapshot.json");
+                    if meta_path.exists() {
+                        if let Ok(content) = fs::read_to_string(&meta_path) {
+                            if let Ok(info) = serde_json::from_str::<SnapshotInfo>(&content) {
+                                snapshots.push(info);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by creation time (newest first)
+        snapshots.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(snapshots)
+    }
+
+    /// Restore a collection from a snapshot.
+    /// Creates a new collection with the given name from snapshot data.
+    pub fn restore_snapshot(&self, snapshot_name: &str, new_collection_name: Option<&str>) -> Result<Arc<Collection>> {
+        let snapshot_path = self.snapshots_dir().join(snapshot_name);
+        if !snapshot_path.exists() {
+            return Err(anyhow::anyhow!("Snapshot '{}' not found", snapshot_name));
+        }
+
+        // Load snapshot metadata
+        let meta_path = snapshot_path.join("snapshot.json");
+        let meta_content = fs::read_to_string(&meta_path)
+            .context("Failed to read snapshot metadata")?;
+        let snapshot_info: SnapshotInfo = serde_json::from_str(&meta_content)
+            .context("Failed to parse snapshot metadata")?;
+
+        // Determine target collection name
+        let target_name = new_collection_name
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| snapshot_info.collection.clone());
+
+        // Check if collection already exists
+        if self.get(&target_name).is_some() {
+            return Err(anyhow::anyhow!(
+                "Collection '{}' already exists. Delete it first or use a different name.",
+                target_name
+            ));
+        }
+
+        // Copy snapshot to collection directory
+        let collection_path = self.base_dir.join(&target_name);
+        copy_dir_recursive(&snapshot_path, &collection_path)?;
+
+        // Update config with new name if different
+        let config_path = collection_path.join("config.json");
+        if let Ok(content) = fs::read_to_string(&config_path) {
+            if let Ok(mut config) = serde_json::from_str::<CollectionConfig>(&content) {
+                config.name = target_name.clone();
+                let new_content = serde_json::to_string_pretty(&config)?;
+                fs::write(&config_path, new_content)?;
+            }
+        }
+
+        // Remove snapshot metadata from restored collection
+        let restored_meta_path = collection_path.join("snapshot.json");
+        let _ = fs::remove_file(restored_meta_path);
+
+        // Load the restored collection
+        let config = CollectionConfig::new(&target_name, 128);
+        let collection = Arc::new(Collection::open(&collection_path, config)?);
+
+        // Add to manager
+        {
+            let mut collections = self.collections.write();
+            collections.insert(target_name.clone(), collection.clone());
+        }
+
+        println!("Restored collection: {} from snapshot: {}", target_name, snapshot_name);
+        Ok(collection)
+    }
+
+    /// Delete a snapshot.
+    pub fn delete_snapshot(&self, snapshot_name: &str) -> Result<()> {
+        let snapshot_path = self.snapshots_dir().join(snapshot_name);
+        if !snapshot_path.exists() {
+            return Err(anyhow::anyhow!("Snapshot '{}' not found", snapshot_name));
+        }
+
+        fs::remove_dir_all(&snapshot_path)?;
+        println!("Deleted snapshot: {}", snapshot_name);
         Ok(())
     }
 }

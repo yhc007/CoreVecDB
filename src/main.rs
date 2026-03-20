@@ -1,8 +1,11 @@
 use anyhow::Result;
 use std::sync::Arc;
 use std::path::Path;
+use tonic::transport::Server;
 use vectordb::collection::CollectionManager;
 use vectordb::config::AppConfig;
+use vectordb::api::VectorServiceImpl;
+use vectordb::proto::vectordb::vector_service_server::VectorServiceServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,6 +22,19 @@ async fn main() -> Result<()> {
     let manager = Arc::new(CollectionManager::new(data_dir)?);
     println!("Collection manager initialized");
     println!("  - Collections: {:?}", manager.names());
+
+    // gRPC Server
+    let grpc_service = VectorServiceImpl::new(manager.clone());
+    let grpc_addr = format!("0.0.0.0:{}", config.server.grpc_port).parse()?;
+    println!("VectorDB gRPC listening on {}", grpc_addr);
+
+    let grpc_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(VectorServiceServer::new(grpc_service))
+            .serve(grpc_addr)
+            .await
+            .unwrap();
+    });
 
     // HTTP Server with multi-collection support
     let http_router = vectordb::api::http::collection_router(manager.clone()).await;
@@ -47,7 +63,8 @@ async fn main() -> Result<()> {
         eprintln!("Failed to save indexes: {:?}", e);
     }
 
-    // Abort HTTP server
+    // Abort servers
+    grpc_handle.abort();
     http_handle.abort();
 
     Ok(())

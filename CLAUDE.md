@@ -97,12 +97,24 @@ Environment override: `APP_SERVER__GRPC_PORT=50052` etc.
 - `DELETE /collections/:name` - Delete collection
 
 ### Vector Operations (with collection)
-- `POST /collections/:name/upsert` - Insert vector
+- `POST /collections/:name/upsert` - Insert single vector
+- `POST /collections/:name/upsert_batch` - Batch insert vectors (~10x faster)
 - `POST /collections/:name/search` - Search vectors
 - `GET /collections/:name/vectors/:id` - Get vector by ID
+- `PUT /collections/:name/vectors/:id` - Update vector (delete + insert, new ID)
+- `PATCH /collections/:name/vectors/:id` - Update metadata only (same ID)
+- `DELETE /collections/:name/vectors/:id` - Delete vector (soft delete)
+- `POST /collections/:name/delete_batch` - Batch delete vectors
+
+### Snapshot Operations
+- `GET /collections/:name/snapshots` - List snapshots
+- `POST /collections/:name/snapshots` - Create snapshot
+- `POST /snapshots/:snapshot_name/restore` - Restore from snapshot
+- `DELETE /snapshots/:snapshot_name` - Delete snapshot
 
 ### Legacy Endpoints (uses "default" collection)
 - `POST /upsert` - Insert vector with metadata
+- `POST /upsert_batch` - Batch insert vectors
 - `POST /search` - k-NN search with optional metadata/ID filtering
 - `GET /vectors/:id` - Retrieve vector by ID
 - `GET /stats` - Get vector count and status
@@ -224,6 +236,60 @@ FilterQuery::not(FilterQuery::eq("status", "deleted"))
 2. **Non-indexed fields**: HNSW search → Post-filter with metadata lookup
 3. **Combined**: Bitmap intersection for multiple filter types
 
+### HTTP Range Filter API
+
+Numeric range queries are available directly through the HTTP API.
+
+#### Request Format
+```json
+{
+  "vector": [...],
+  "k": 10,
+  "filter": {"category": "electronics"},
+  "range_filters": [
+    {"op": "gt", "field": "price", "value": 100},
+    {"op": "lte", "field": "rating", "value": 5.0}
+  ]
+}
+```
+
+#### Supported Operators
+| Operator | JSON Format | Description |
+|----------|-------------|-------------|
+| `gt` | `{"op": "gt", "field": "price", "value": 100}` | price > 100 |
+| `gte` | `{"op": "gte", "field": "price", "value": 100}` | price >= 100 |
+| `lt` | `{"op": "lt", "field": "price", "value": 100}` | price < 100 |
+| `lte` | `{"op": "lte", "field": "price", "value": 100}` | price <= 100 |
+| `range` | `{"op": "range", "field": "price", "min": 50, "max": 200}` | 50 <= price <= 200 |
+| `between` | `{"op": "between", "field": "price", "min": 50, "max": 200}` | 50 < price < 200 |
+
+#### Example Usage
+```bash
+# Find products with price > 100 AND rating >= 4.0
+curl -X POST http://localhost:3000/collections/products/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [...],
+    "k": 10,
+    "filter": {},
+    "range_filters": [
+      {"op": "gt", "field": "price", "value": 100},
+      {"op": "gte", "field": "rating", "value": 4.0}
+    ]
+  }'
+
+# Combine with string filter
+curl -X POST http://localhost:3000/collections/products/search \
+  -d '{
+    "vector": [...],
+    "k": 10,
+    "filter": {"category": "electronics"},
+    "range_filters": [
+      {"op": "range", "field": "price", "min": 50, "max": 500}
+    ]
+  }'
+```
+
 ### Performance
 | Filter Type | Complexity | Notes |
 |-------------|------------|-------|
@@ -306,6 +372,296 @@ data/
 | `quantization_enabled` | bool | false | Enable scalar quantization |
 | `indexed_fields` | string[] | [] | String fields for exact match filtering |
 | `numeric_fields` | string[] | [] | Numeric fields for range queries |
+
+## Update Vector
+
+Update vectors or metadata. Two methods available:
+
+### PUT - Full Vector Update
+Replaces the vector and metadata. Since storage is append-only, this creates a new ID.
+
+```bash
+curl -X PUT http://localhost:3000/collections/products/vectors/123 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [0.1, 0.2, ...],
+    "metadata": {"category": "electronics", "price": "299"}
+  }'
+```
+
+Response:
+```json
+{
+  "old_id": 123,
+  "new_id": 456,
+  "collection": "products",
+  "updated": true
+}
+```
+
+**Note**: The old ID is soft-deleted, and a new ID is assigned. Update your references to use the new ID.
+
+### PATCH - Metadata Only Update
+Updates metadata without changing the vector. Keeps the same ID.
+
+```bash
+curl -X PATCH http://localhost:3000/collections/products/vectors/123 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "metadata": {"price": "249", "on_sale": "true"}
+  }'
+```
+
+Response:
+```json
+{
+  "id": 123,
+  "collection": "products",
+  "updated": true
+}
+```
+
+### When to Use Which
+| Method | Use Case | ID Changes |
+|--------|----------|------------|
+| PUT | Change vector values | Yes (new ID) |
+| PATCH | Change metadata only | No (same ID) |
+
+### HTTP Status Codes
+| Code | Meaning |
+|------|---------|
+| 200 | Successfully updated |
+| 404 | Vector ID not found |
+| 410 | Vector already deleted |
+
+## Delete Vector
+
+Soft delete vectors using tombstones. Deleted vectors are excluded from search results.
+
+### API Endpoints
+```bash
+# Delete single vector
+DELETE /collections/:name/vectors/:id
+
+# Batch delete
+POST /collections/:name/delete_batch
+```
+
+### Delete Single Vector
+```bash
+curl -X DELETE http://localhost:3000/collections/products/vectors/123
+```
+
+Response:
+```json
+{"id": 123, "collection": "products", "deleted": true}
+```
+
+### Batch Delete
+```bash
+curl -X POST http://localhost:3000/collections/products/delete_batch \
+  -H "Content-Type: application/json" \
+  -d '{"ids": [1, 2, 3, 4, 5]}'
+```
+
+Response:
+```json
+{"collection": "products", "deleted_count": 5, "requested_count": 5}
+```
+
+### HTTP Status Codes
+| Code | Meaning |
+|------|---------|
+| 200 | Successfully deleted |
+| 404 | Vector ID not found |
+| 410 | Already deleted (Gone) |
+
+### Collection Info with Delete Count
+```json
+{
+  "name": "products",
+  "dim": 128,
+  "vector_count": 950,    // Active vectors
+  "deleted_count": 50,    // Deleted vectors
+  ...
+}
+```
+
+### Implementation Details
+- **Soft delete**: Uses RoaringBitmap to track deleted IDs
+- **Persisted**: Deleted IDs saved to `deleted.bin` on flush
+- **Search filter**: Deleted IDs automatically excluded from search results
+- **Get returns 410**: Attempting to get deleted vector returns HTTP 410 Gone
+
+### Storage
+```
+data/products/
+├── vectors.bin       # Vector data (includes deleted)
+├── deleted.bin       # Deleted ID bitmap
+└── ...
+```
+
+## Snapshot/Backup
+
+Create and restore backups of collections.
+
+### API Endpoints
+```bash
+# List snapshots for a collection
+GET /collections/:name/snapshots
+
+# Create a snapshot
+POST /collections/:name/snapshots
+
+# Restore from snapshot
+POST /snapshots/:snapshot_name/restore
+
+# Delete a snapshot
+DELETE /snapshots/:snapshot_name
+```
+
+### Create Snapshot
+```bash
+curl -X POST http://localhost:3000/collections/products/snapshots
+```
+
+Response:
+```json
+{
+  "name": "products_20240320_143052",
+  "collection": "products",
+  "created_at": "2024-03-20T14:30:52Z",
+  "vector_count": 10000,
+  "size_bytes": 5242880
+}
+```
+
+### List Snapshots
+```bash
+curl http://localhost:3000/collections/products/snapshots
+```
+
+### Restore from Snapshot
+```bash
+# Restore with original name (collection must not exist)
+curl -X POST http://localhost:3000/snapshots/products_20240320_143052/restore \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Restore with new name
+curl -X POST http://localhost:3000/snapshots/products_20240320_143052/restore \
+  -d '{"new_name": "products_restored"}'
+```
+
+### Delete Snapshot
+```bash
+curl -X DELETE http://localhost:3000/snapshots/products_20240320_143052
+```
+
+### Storage Structure
+```
+data/
+├── products/           # Active collection
+│   └── ...
+└── _snapshots/         # Snapshot storage
+    ├── products_20240320_143052/
+    │   ├── snapshot.json   # Metadata
+    │   ├── config.json
+    │   ├── vectors.bin
+    │   ├── index.hnsw.*
+    │   └── meta.sled/
+    └── products_20240319_120000/
+        └── ...
+```
+
+### Use Cases
+- **Backup before risky operations**: Create snapshot before bulk deletes
+- **Point-in-time recovery**: Restore to previous state
+- **Clone collections**: Restore with new name for testing
+- **Migration**: Move collections between environments
+
+## Batch Upsert
+
+Bulk insert API for ~10x performance improvement over individual inserts.
+
+### API Endpoints
+```bash
+# Batch upsert to specific collection
+POST /collections/:name/upsert_batch
+
+# Batch upsert using default collection
+POST /upsert_batch
+```
+
+### Request Format
+```json
+{
+  "vectors": [
+    {
+      "vector": [0.1, 0.2, ...],
+      "metadata": {"category": "A", "price": "100"}
+    },
+    {
+      "vector": [0.3, 0.4, ...],
+      "metadata": {"category": "B", "price": "200"}
+    }
+  ]
+}
+```
+
+### Response Format
+```json
+{
+  "start_id": 0,
+  "count": 2,
+  "success": true
+}
+```
+
+### Usage Example
+```bash
+# Insert 100 vectors at once
+curl -X POST http://localhost:3000/collections/products/upsert_batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": [
+      {"vector": [...], "metadata": {"category": "electronics"}},
+      {"vector": [...], "metadata": {"category": "books"}},
+      ...
+    ]
+  }'
+```
+
+### Python Example
+```python
+import requests
+
+vectors = [
+    {"vector": [random.random() for _ in range(128)], "metadata": {"idx": str(i)}}
+    for i in range(1000)
+]
+
+resp = requests.post(
+    "http://localhost:3000/collections/products/upsert_batch",
+    json={"vectors": vectors}
+)
+print(resp.json())  # {"start_id": 0, "count": 1000, "success": true}
+```
+
+### Performance Optimizations
+| Layer | Optimization |
+|-------|-------------|
+| **VectorStore** | Single flush after batch (vs per-vector) |
+| **MetadataStore** | Atomic sled::Batch write |
+| **HnswIndexer** | Uses `parallel_insert` for multi-threaded indexing |
+| **PayloadIndex** | Batch index updates |
+
+### Benchmark (100 vectors, 128-dim)
+| Method | Time | Throughput |
+|--------|------|------------|
+| Individual inserts | ~1.5s | ~65 vectors/sec |
+| Batch upsert | ~0.15s | ~650 vectors/sec |
+| **Speedup** | **~10x** | |
 
 ## Performance Benchmarks
 

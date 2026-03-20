@@ -1,11 +1,13 @@
 use axum::{
-    routing::{get, post, delete},
+    routing::{get, post, delete, put, patch},
     Router, Json, extract::{State, Path},
     http::StatusCode,
 };
 use std::sync::Arc;
-use crate::api::{VectorServiceImpl, create_filter_bitmap, create_range_bitmap};
-use crate::collection::{CollectionManager, CollectionConfig, CollectionInfo};
+use crate::api::{create_filter_bitmap, create_range_bitmap};
+use crate::collection::{CollectionManager, CollectionConfig, CollectionInfo, SnapshotInfo};
+use crate::storage::{MetadataEntry, IndexedMetadata};
+use crate::payload::FilterQuery;
 use serde::{Deserialize, Serialize};
 
 // Wrapper structs for JSON compatibility if proto structs don't behave well with Serde automatically
@@ -22,11 +24,107 @@ pub struct JsonUpsertReq {
     metadata: std::collections::HashMap<String, String>,
 }
 
+/// Single vector in batch upsert request.
+#[derive(Deserialize)]
+pub struct BatchVectorReq {
+    vector: Vec<f32>,
+    #[serde(default)]
+    metadata: std::collections::HashMap<String, String>,
+}
+
+/// Batch upsert request - insert multiple vectors at once.
+#[derive(Deserialize)]
+pub struct JsonBatchUpsertReq {
+    vectors: Vec<BatchVectorReq>,
+}
+
+/// Batch upsert response.
+#[derive(Serialize)]
+pub struct JsonBatchUpsertResp {
+    start_id: u64,
+    count: usize,
+    success: bool,
+}
+
+/// Range filter for numeric fields.
+#[derive(Deserialize, Clone)]
+#[serde(tag = "op")]
+pub enum RangeFilter {
+    /// Greater than: field > value
+    #[serde(rename = "gt")]
+    Gt { field: String, value: f64 },
+    /// Greater than or equal: field >= value
+    #[serde(rename = "gte")]
+    Gte { field: String, value: f64 },
+    /// Less than: field < value
+    #[serde(rename = "lt")]
+    Lt { field: String, value: f64 },
+    /// Less than or equal: field <= value
+    #[serde(rename = "lte")]
+    Lte { field: String, value: f64 },
+    /// Range: min <= field <= max (inclusive)
+    #[serde(rename = "range")]
+    Range { field: String, min: f64, max: f64 },
+    /// Between: min < field < max (exclusive)
+    #[serde(rename = "between")]
+    Between { field: String, min: f64, max: f64 },
+}
+
+impl RangeFilter {
+    /// Convert to FilterQuery for use with PayloadIndex.
+    fn to_filter_query(&self) -> FilterQuery {
+        match self {
+            RangeFilter::Gt { field, value } => FilterQuery::gt_f(field, *value),
+            RangeFilter::Gte { field, value } => FilterQuery::gte_f(field, *value),
+            RangeFilter::Lt { field, value } => FilterQuery::lt_f(field, *value),
+            RangeFilter::Lte { field, value } => FilterQuery::lte_f(field, *value),
+            RangeFilter::Range { field, min, max } => FilterQuery::range_f(field, *min, *max),
+            RangeFilter::Between { field, min, max } => {
+                // Between is min < field < max, using AND of Gt and Lt
+                FilterQuery::and(vec![
+                    FilterQuery::gt_f(field, *min),
+                    FilterQuery::lt_f(field, *max),
+                ])
+            }
+        }
+    }
+}
+
+/// Apply range filters using IndexedMetadata.
+/// Returns bitmap of matching IDs.
+fn apply_range_filters(
+    metadata_store: &dyn IndexedMetadata,
+    range_filters: &[RangeFilter],
+) -> Option<roaring::RoaringBitmap> {
+    if range_filters.is_empty() {
+        return None;
+    }
+
+    // Convert to FilterQuery and combine with AND
+    let queries: Vec<FilterQuery> = range_filters
+        .iter()
+        .map(|rf| rf.to_filter_query())
+        .collect();
+
+    let combined = if queries.len() == 1 {
+        queries.into_iter().next().unwrap()
+    } else {
+        FilterQuery::and(queries)
+    };
+
+    metadata_store.filter(&combined)
+}
+
 #[derive(Deserialize)]
 pub struct JsonSearchReq {
     vector: Vec<f32>,
     k: u32,
+    /// String field exact match filters (AND).
+    #[serde(default)]
     filter: std::collections::HashMap<String, String>,
+    /// Numeric range filters (AND with other filters).
+    #[serde(default)]
+    range_filters: Vec<RangeFilter>,
     filter_ids: Option<Vec<u64>>,
     /// Range filter: [start, end] inclusive. More efficient than listing all IDs.
     filter_id_range: Option<(u64, u64)>,
@@ -41,156 +139,6 @@ pub struct JsonSearchResp {
 pub struct JsonSearchResult {
     id: u64,
     score: f32,
-}
-
-pub struct AppState {
-    pub service: Arc<VectorServiceImpl>,
-}
-
-pub async fn router(service: Arc<VectorServiceImpl>) -> Router {
-    let state = Arc::new(AppState { service });
-
-    Router::new()
-        .route("/upsert", post(upsert))
-        .route("/search", post(search))
-        .route("/vectors/:id", get(get_vector))
-        .route("/stats", get(get_stats))
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any),
-        )
-        .nest_service("/", tower_http::services::ServeDir::new("ui"))
-        .with_state(state)
-}
-
-async fn get_stats(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    let count = state.service.vector_store.len();
-    // Assuming dim is constant 128 for now as per main.rs
-    // Ideally we expose dim from store or config. 
-    // MemmapVectorStore has dim field but it is not exposed via trait.
-    // We can add dim() to VectorStore trait later if needed.
-    Json(serde_json::json!({
-        "vector_count": count,
-        "dimension": 128, 
-        "status": "Ready"
-    }))
-}
-
-async fn upsert(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<JsonUpsertReq>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let internal_id = state.service.vector_store.insert(&payload.vector)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    state.service.indexer.insert(internal_id, &payload.vector)
-         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    for (k, v) in payload.metadata {
-        state.service.metadata_store.insert(internal_id, k, v)
-             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
-
-    Ok(Json(serde_json::json!({ "id": internal_id, "success": true })))
-}
-
-async fn search(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<JsonSearchReq>,
-) -> Result<Json<JsonSearchResp>, StatusCode> {
-
-    // Build filter bitmap efficiently - combine all filter sources
-    // Priority: payload index (fastest) > id range > explicit ids
-    let mut filter_bitmap: Option<roaring::RoaringBitmap> = None;
-
-    // 1. Try payload index pre-filtering (indexed fields)
-    //    Functional: collect conditions as Vec of refs, then try index
-    let has_metadata_filter = !payload.filter.is_empty();
-    let used_index_filter = if has_metadata_filter {
-        let conditions: Vec<(&str, &str)> = payload
-            .filter
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        if let Some(indexed_bitmap) = state.service.metadata_store.try_filter_and(&conditions) {
-            // Index hit - use pre-filtered IDs
-            filter_bitmap = Some(indexed_bitmap);
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    // 2. Combine with range filter if present
-    if let Some((start, end)) = payload.filter_id_range {
-        let range_bitmap = create_range_bitmap(start, end);
-        filter_bitmap = Some(
-            filter_bitmap
-                .map(|existing| existing & &range_bitmap)
-                .unwrap_or(range_bitmap)
-        );
-    }
-
-    // 3. Combine with explicit id filter if present
-    if let Some(ref ids) = payload.filter_ids {
-        if !ids.is_empty() {
-            let id_bitmap = create_filter_bitmap(ids);
-            filter_bitmap = Some(
-                filter_bitmap
-                    .map(|existing| existing & &id_bitmap)
-                    .unwrap_or(id_bitmap)
-            );
-        }
-    }
-
-    let results = state.service.indexer.search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Post-filter only if metadata filter exists AND index was not used
-    let final_results: Vec<JsonSearchResult> = if has_metadata_filter && !used_index_filter {
-        // Fallback: post-filter (for non-indexed fields)
-        results
-            .into_iter()
-            .filter(|(id, _)| {
-                payload.filter.iter().all(|(fk, fv)| {
-                    state.service.metadata_store
-                        .get(*id, fk)
-                        .ok()
-                        .flatten()
-                        .as_ref()
-                        .map(|v| v == fv)
-                        .unwrap_or(false)
-                })
-            })
-            .map(|(id, score)| JsonSearchResult { id, score })
-            .collect()
-    } else {
-        // No post-filter needed (either no metadata filter or index was used)
-        results
-            .into_iter()
-            .map(|(id, score)| JsonSearchResult { id, score })
-            .collect()
-    };
-
-    Ok(Json(JsonSearchResp { results: final_results }))
-}
-
-async fn get_vector(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<u64>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    if let Ok(vec) = state.service.vector_store.get(id) {
-        Ok(Json(serde_json::json!({ "id": id, "vector": vec, "found": true })))
-    } else {
-        Err(StatusCode::NOT_FOUND)
-    }
 }
 
 // ============================================================================
@@ -229,10 +177,21 @@ pub async fn collection_router(manager: Arc<CollectionManager>) -> Router {
         .route("/collections/:name", delete(delete_collection))
         // Vector operations with collection
         .route("/collections/:name/upsert", post(collection_upsert))
+        .route("/collections/:name/upsert_batch", post(collection_upsert_batch))
         .route("/collections/:name/search", post(collection_search))
         .route("/collections/:name/vectors/:id", get(collection_get_vector))
+        .route("/collections/:name/vectors/:id", put(collection_update_vector))
+        .route("/collections/:name/vectors/:id", patch(collection_update_metadata))
+        .route("/collections/:name/vectors/:id", delete(collection_delete_vector))
+        .route("/collections/:name/delete_batch", post(collection_delete_batch))
+        // Snapshot operations
+        .route("/collections/:name/snapshots", get(list_snapshots))
+        .route("/collections/:name/snapshots", post(create_snapshot))
+        .route("/snapshots/:snapshot_name", delete(delete_snapshot))
+        .route("/snapshots/:snapshot_name/restore", post(restore_snapshot))
         // Legacy routes (use default collection)
         .route("/upsert", post(legacy_upsert))
+        .route("/upsert_batch", post(legacy_upsert_batch))
         .route("/search", post(legacy_search))
         .route("/vectors/:id", get(legacy_get_vector))
         .route("/stats", get(legacy_stats))
@@ -328,6 +287,72 @@ async fn collection_upsert(
     })))
 }
 
+/// Batch upsert - insert multiple vectors at once.
+/// ~10x faster than individual upserts for large batches.
+async fn collection_upsert_batch(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<JsonBatchUpsertReq>,
+) -> Result<Json<JsonBatchUpsertResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if payload.vectors.is_empty() {
+        return Ok(Json(JsonBatchUpsertResp {
+            start_id: collection.len() as u64,
+            count: 0,
+            success: true,
+        }));
+    }
+
+    // Extract vectors for batch insert
+    let vectors: Vec<Vec<f32>> = payload.vectors
+        .iter()
+        .map(|v| v.vector.clone())
+        .collect();
+
+    // Batch insert to vector store
+    let start_id = collection.vector_store.insert_batch(&vectors)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Prepare index data: (id, vector)
+    let index_data: Vec<(u64, Vec<f32>)> = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (start_id + i as u64, v))
+        .collect();
+
+    // Batch insert to HNSW index
+    collection.indexer.insert_batch(&index_data)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Collect metadata entries
+    let metadata_entries: Vec<MetadataEntry> = payload.vectors
+        .iter()
+        .enumerate()
+        .flat_map(|(i, v)| {
+            let id = start_id + i as u64;
+            v.metadata.iter().map(move |(k, val)| MetadataEntry {
+                id,
+                key: k.clone(),
+                value: val.clone(),
+            })
+        })
+        .collect();
+
+    // Batch insert metadata
+    if !metadata_entries.is_empty() {
+        collection.metadata_store.insert_batch(&metadata_entries)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(JsonBatchUpsertResp {
+        start_id,
+        count: payload.vectors.len(),
+        success: true,
+    }))
+}
+
 async fn collection_search(
     State(state): State<Arc<CollectionAppState>>,
     Path(name): Path<String>,
@@ -339,6 +364,7 @@ async fn collection_search(
     // Build filter bitmap
     let mut filter_bitmap: Option<roaring::RoaringBitmap> = None;
 
+    // 1. String field filters (exact match)
     let has_metadata_filter = !payload.filter.is_empty();
     let used_index_filter = if has_metadata_filter {
         let conditions: Vec<(&str, &str)> = payload
@@ -357,6 +383,26 @@ async fn collection_search(
         false
     };
 
+    // 2. Range filters (numeric fields)
+    let has_range_filter = !payload.range_filters.is_empty();
+    if has_range_filter {
+        // Try to downcast to IndexedMetadata for range filter support
+        // IndexedSledMetadataStore implements IndexedMetadata trait
+        if let Some(indexed_store) = collection.metadata_store
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::storage::IndexedSledMetadataStore>())
+        {
+            if let Some(range_bitmap) = apply_range_filters(indexed_store, &payload.range_filters) {
+                filter_bitmap = Some(
+                    filter_bitmap
+                        .map(|existing| existing & &range_bitmap)
+                        .unwrap_or(range_bitmap)
+                );
+            }
+        }
+    }
+
+    // 3. ID range filter
     if let Some((start, end)) = payload.filter_id_range {
         let range_bitmap = create_range_bitmap(start, end);
         filter_bitmap = Some(
@@ -366,6 +412,7 @@ async fn collection_search(
         );
     }
 
+    // 4. Explicit ID filter
     if let Some(ref ids) = payload.filter_ids {
         if !ids.is_empty() {
             let id_bitmap = create_filter_bitmap(ids);
@@ -375,6 +422,25 @@ async fn collection_search(
                     .unwrap_or(id_bitmap)
             );
         }
+    }
+
+    // 5. Exclude deleted vectors
+    let deleted_bitmap = collection.deleted_bitmap();
+    if !deleted_bitmap.is_empty() {
+        // Create universe bitmap (all valid IDs)
+        let total = collection.len() as u64;
+        let mut universe = roaring::RoaringBitmap::new();
+        universe.insert_range(0..total as u32);
+
+        // Remove deleted IDs from universe
+        let active_bitmap = &universe - &deleted_bitmap;
+
+        // Combine with existing filter
+        filter_bitmap = Some(
+            filter_bitmap
+                .map(|existing| existing & &active_bitmap)
+                .unwrap_or(active_bitmap)
+        );
     }
 
     let results = collection.indexer.search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())
@@ -413,6 +479,11 @@ async fn collection_get_vector(
     let collection = state.manager.get(&name)
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    // Check if deleted
+    if collection.is_deleted(id) {
+        return Err(StatusCode::GONE);
+    }
+
     if let Ok(vec) = collection.vector_store.get(id) {
         Ok(Json(serde_json::json!({
             "id": id,
@@ -423,6 +494,202 @@ async fn collection_get_vector(
     } else {
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+/// Delete a vector by ID.
+async fn collection_delete_vector(
+    State(state): State<Arc<CollectionAppState>>,
+    Path((name, id)): Path<(String, u64)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    match collection.delete(id) {
+        Ok(true) => Ok(Json(serde_json::json!({
+            "id": id,
+            "collection": name,
+            "deleted": true
+        }))),
+        Ok(false) => Err(StatusCode::GONE), // Already deleted
+        Err(_) => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// Batch delete request.
+#[derive(Deserialize)]
+pub struct BatchDeleteReq {
+    ids: Vec<u64>,
+}
+
+/// Update vector request.
+#[derive(Deserialize)]
+pub struct UpdateVectorReq {
+    vector: Vec<f32>,
+    #[serde(default)]
+    metadata: std::collections::HashMap<String, String>,
+}
+
+/// Update metadata only request.
+#[derive(Deserialize)]
+pub struct UpdateMetadataReq {
+    metadata: std::collections::HashMap<String, String>,
+}
+
+/// Delete multiple vectors by ID.
+async fn collection_delete_batch(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<BatchDeleteReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let count = collection.delete_batch(&payload.ids)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "collection": name,
+        "deleted_count": count,
+        "requested_count": payload.ids.len()
+    })))
+}
+
+/// Update a vector (delete old + insert new).
+/// Returns the new ID since vectors are append-only.
+async fn collection_update_vector(
+    State(state): State<Arc<CollectionAppState>>,
+    Path((name, old_id)): Path<(String, u64)>,
+    Json(payload): Json<UpdateVectorReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Check if vector exists and not already deleted
+    if old_id as usize >= collection.len() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    if collection.is_deleted(old_id) {
+        return Err(StatusCode::GONE);
+    }
+
+    // Delete old vector
+    collection.delete(old_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Insert new vector
+    let new_id = collection.vector_store.insert(&payload.vector)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Index new vector
+    collection.indexer.insert(new_id, &payload.vector)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Insert metadata
+    for (k, v) in payload.metadata {
+        collection.metadata_store.insert(new_id, k, v)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "old_id": old_id,
+        "new_id": new_id,
+        "collection": name,
+        "updated": true
+    })))
+}
+
+/// Update metadata only (no vector change, same ID).
+async fn collection_update_metadata(
+    State(state): State<Arc<CollectionAppState>>,
+    Path((name, id)): Path<(String, u64)>,
+    Json(payload): Json<UpdateMetadataReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Check if vector exists and not deleted
+    if id as usize >= collection.len() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    if collection.is_deleted(id) {
+        return Err(StatusCode::GONE);
+    }
+
+    // Update metadata (overwrites existing keys)
+    for (k, v) in payload.metadata {
+        collection.metadata_store.insert(id, k, v)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "collection": name,
+        "updated": true
+    })))
+}
+
+// ============================================================================
+// Snapshot Handlers
+// ============================================================================
+
+/// List all snapshots for a collection.
+async fn list_snapshots(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<SnapshotInfo>>, StatusCode> {
+    // Verify collection exists
+    if state.manager.get(&name).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    state.manager.list_snapshots(&name)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Create a snapshot of a collection.
+async fn create_snapshot(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<SnapshotInfo>, StatusCode> {
+    state.manager.create_snapshot(&name)
+        .map(Json)
+        .map_err(|e| {
+            eprintln!("Failed to create snapshot: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Request to restore a snapshot.
+#[derive(Deserialize)]
+pub struct RestoreSnapshotReq {
+    /// Optional new collection name. If not provided, uses original name.
+    #[serde(default)]
+    new_name: Option<String>,
+}
+
+/// Restore a collection from a snapshot.
+async fn restore_snapshot(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(snapshot_name): Path<String>,
+    Json(payload): Json<RestoreSnapshotReq>,
+) -> Result<Json<CollectionInfo>, StatusCode> {
+    state.manager.restore_snapshot(&snapshot_name, payload.new_name.as_deref())
+        .map(|c| Json(c.info()))
+        .map_err(|e| {
+            eprintln!("Failed to restore snapshot: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Delete a snapshot.
+async fn delete_snapshot(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(snapshot_name): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    state.manager.delete_snapshot(&snapshot_name)
+        .map(|_| Json(serde_json::json!({ "deleted": true, "snapshot": snapshot_name })))
+        .map_err(|_| StatusCode::NOT_FOUND)
 }
 
 // ============================================================================
@@ -452,6 +719,70 @@ async fn legacy_upsert(
     Ok(Json(serde_json::json!({ "id": internal_id, "success": true })))
 }
 
+/// Legacy batch upsert using default collection.
+async fn legacy_upsert_batch(
+    State(state): State<Arc<CollectionAppState>>,
+    Json(payload): Json<JsonBatchUpsertReq>,
+) -> Result<Json<JsonBatchUpsertResp>, StatusCode> {
+    let collection = state.manager.get_or_create_default(DEFAULT_DIM)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if payload.vectors.is_empty() {
+        return Ok(Json(JsonBatchUpsertResp {
+            start_id: collection.len() as u64,
+            count: 0,
+            success: true,
+        }));
+    }
+
+    // Extract vectors
+    let vectors: Vec<Vec<f32>> = payload.vectors
+        .iter()
+        .map(|v| v.vector.clone())
+        .collect();
+
+    // Batch insert to vector store
+    let start_id = collection.vector_store.insert_batch(&vectors)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Prepare index data
+    let index_data: Vec<(u64, Vec<f32>)> = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (start_id + i as u64, v))
+        .collect();
+
+    // Batch insert to HNSW index
+    collection.indexer.insert_batch(&index_data)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Collect metadata entries
+    let metadata_entries: Vec<MetadataEntry> = payload.vectors
+        .iter()
+        .enumerate()
+        .flat_map(|(i, v)| {
+            let id = start_id + i as u64;
+            v.metadata.iter().map(move |(k, val)| MetadataEntry {
+                id,
+                key: k.clone(),
+                value: val.clone(),
+            })
+        })
+        .collect();
+
+    // Batch insert metadata
+    if !metadata_entries.is_empty() {
+        collection.metadata_store.insert_batch(&metadata_entries)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(JsonBatchUpsertResp {
+        start_id,
+        count: payload.vectors.len(),
+        success: true,
+    }))
+}
+
 async fn legacy_search(
     State(state): State<Arc<CollectionAppState>>,
     Json(payload): Json<JsonSearchReq>,
@@ -462,6 +793,7 @@ async fn legacy_search(
     // Build filter bitmap
     let mut filter_bitmap: Option<roaring::RoaringBitmap> = None;
 
+    // 1. String field filters
     let has_metadata_filter = !payload.filter.is_empty();
     let used_index_filter = if has_metadata_filter {
         let conditions: Vec<(&str, &str)> = payload
@@ -480,6 +812,24 @@ async fn legacy_search(
         false
     };
 
+    // 2. Range filters
+    let has_range_filter = !payload.range_filters.is_empty();
+    if has_range_filter {
+        if let Some(indexed_store) = collection.metadata_store
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::storage::IndexedSledMetadataStore>())
+        {
+            if let Some(range_bitmap) = apply_range_filters(indexed_store, &payload.range_filters) {
+                filter_bitmap = Some(
+                    filter_bitmap
+                        .map(|existing| existing & &range_bitmap)
+                        .unwrap_or(range_bitmap)
+                );
+            }
+        }
+    }
+
+    // 3. ID range filter
     if let Some((start, end)) = payload.filter_id_range {
         let range_bitmap = create_range_bitmap(start, end);
         filter_bitmap = Some(
@@ -489,6 +839,7 @@ async fn legacy_search(
         );
     }
 
+    // 4. Explicit ID filter
     if let Some(ref ids) = payload.filter_ids {
         if !ids.is_empty() {
             let id_bitmap = create_filter_bitmap(ids);
@@ -498,6 +849,20 @@ async fn legacy_search(
                     .unwrap_or(id_bitmap)
             );
         }
+    }
+
+    // 5. Exclude deleted vectors
+    let deleted_bitmap = collection.deleted_bitmap();
+    if !deleted_bitmap.is_empty() {
+        let total = collection.len() as u64;
+        let mut universe = roaring::RoaringBitmap::new();
+        universe.insert_range(0..total as u32);
+        let active_bitmap = &universe - &deleted_bitmap;
+        filter_bitmap = Some(
+            filter_bitmap
+                .map(|existing| existing & &active_bitmap)
+                .unwrap_or(active_bitmap)
+        );
     }
 
     let results = collection.indexer.search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())

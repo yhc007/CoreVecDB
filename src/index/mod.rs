@@ -1,8 +1,7 @@
 use std::path::Path;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use hnsw_rs::prelude::*;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 pub enum DistanceMetric {
     Euclidean,
@@ -61,6 +60,35 @@ impl HnswIndexer {
         // hnsw-rs insert requires (data, id)
         // id is usize.
         self.inner.insert((vector, id as usize));
+        Ok(())
+    }
+
+    /// Batch insert using parallel_insert for ~10x speedup.
+    /// Takes vectors with their pre-assigned IDs (from vector store).
+    pub fn insert_batch(&self, vectors: &[(u64, Vec<f32>)]) -> Result<()> {
+        if vectors.is_empty() {
+            return Ok(());
+        }
+
+        // Validate dimensions
+        for (id, v) in vectors {
+            if v.len() != self.dim {
+                return Err(anyhow::anyhow!(
+                    "Vector {} dimension mismatch: expected {}, got {}",
+                    id, self.dim, v.len()
+                ));
+            }
+        }
+
+        // Prepare data for parallel_insert: Vec<(&Vec<f32>, usize)>
+        // hnsw_rs expects &Vec<f32>, not &[f32]
+        let data: Vec<(&Vec<f32>, usize)> = vectors
+            .iter()
+            .map(|(id, v)| (v, *id as usize))
+            .collect();
+
+        // Use parallel_insert for bulk operations
+        self.inner.parallel_insert(&data);
         Ok(())
     }
 

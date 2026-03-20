@@ -3,19 +3,89 @@ syntax = "proto3";
 package vectordb;
 
 service VectorService {
+  // Collection management
+  rpc CreateCollection (CreateCollectionRequest) returns (CreateCollectionResponse);
+  rpc ListCollections (ListCollectionsRequest) returns (ListCollectionsResponse);
+  rpc GetCollectionInfo (GetCollectionInfoRequest) returns (CollectionInfo);
+  rpc DeleteCollection (DeleteCollectionRequest) returns (DeleteCollectionResponse);
+
+  // Vector operations (with collection)
   rpc Upsert (UpsertRequest) returns (UpsertResponse);
+  rpc UpsertBatch (UpsertBatchRequest) returns (UpsertBatchResponse);
   rpc Search (SearchRequest) returns (SearchResponse);
   rpc Get (GetRequest) returns (GetResponse);
+  rpc Delete (DeleteRequest) returns (DeleteResponse);
+  rpc DeleteBatch (DeleteBatchRequest) returns (DeleteBatchResponse);
+  rpc Update (UpdateRequest) returns (UpdateResponse);
+  rpc UpdateMetadata (UpdateMetadataRequest) returns (UpdateMetadataResponse);
+
+  // Snapshot operations
+  rpc CreateSnapshot (CreateSnapshotRequest) returns (SnapshotInfo);
+  rpc ListSnapshots (ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc RestoreSnapshot (RestoreSnapshotRequest) returns (CollectionInfo);
+  rpc DeleteSnapshot (DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
 }
+
+// ============================================================================
+// Collection Management
+// ============================================================================
+
+message CreateCollectionRequest {
+  string name = 1;
+  uint32 dim = 2;
+  string distance = 3;  // "euclidean" or "cosine"
+  bool quantization_enabled = 4;
+  repeated string indexed_fields = 5;
+  repeated string numeric_fields = 6;
+}
+
+message CreateCollectionResponse {
+  CollectionInfo info = 1;
+  bool success = 2;
+}
+
+message ListCollectionsRequest {}
+
+message ListCollectionsResponse {
+  repeated CollectionInfo collections = 1;
+}
+
+message GetCollectionInfoRequest {
+  string collection = 1;
+}
+
+message CollectionInfo {
+  string name = 1;
+  uint32 dim = 2;
+  uint64 vector_count = 3;
+  uint64 deleted_count = 4;
+  string distance_metric = 5;
+  bool quantization_enabled = 6;
+  repeated string indexed_fields = 7;
+  repeated string numeric_fields = 8;
+}
+
+message DeleteCollectionRequest {
+  string collection = 1;
+}
+
+message DeleteCollectionResponse {
+  bool success = 1;
+}
+
+// ============================================================================
+// Vector Operations
+// ============================================================================
 
 message Vector {
   repeated float elements = 1;
 }
 
 message UpsertRequest {
-  uint64 id = 1; // Explicit ID for now, or could be auto-generated
-  Vector vector = 2;
-  map<string, string> metadata = 3;
+  string collection = 1;  // Collection name (empty = default)
+  uint64 id = 2;
+  Vector vector = 3;
+  map<string, string> metadata = 4;
 }
 
 message UpsertResponse {
@@ -23,11 +93,37 @@ message UpsertResponse {
   bool success = 2;
 }
 
-message SearchRequest {
+message UpsertBatchRequest {
+  string collection = 1;
+  repeated BatchVector vectors = 2;
+}
+
+message BatchVector {
   Vector vector = 1;
-  uint32 k = 2; // Number of neighbors
-  map<string, string> filter = 3; // Exact match filter for MVP
-  repeated uint64 filter_ids = 4; // List of allowed IDs
+  map<string, string> metadata = 2;
+}
+
+message UpsertBatchResponse {
+  uint64 start_id = 1;
+  uint32 count = 2;
+  bool success = 3;
+}
+
+message SearchRequest {
+  string collection = 1;
+  Vector vector = 2;
+  uint32 k = 3;
+  map<string, string> filter = 4;
+  repeated uint64 filter_ids = 5;
+  repeated RangeFilter range_filters = 6;
+}
+
+message RangeFilter {
+  string field = 1;
+  string op = 2;  // "gt", "gte", "lt", "lte", "range", "between"
+  double value = 3;  // For gt, gte, lt, lte
+  double min = 4;    // For range, between
+  double max = 5;    // For range, between
 }
 
 message SearchResult {
@@ -40,11 +136,94 @@ message SearchResponse {
 }
 
 message GetRequest {
-  uint64 id = 1;
+  string collection = 1;
+  uint64 id = 2;
 }
 
 message GetResponse {
-  Vector vector = 1;
-  map<string, string> metadata = 2;
-  bool found = 3;
+  uint64 id = 1;
+  Vector vector = 2;
+  map<string, string> metadata = 3;
+  bool found = 4;
+}
+
+message DeleteRequest {
+  string collection = 1;
+  uint64 id = 2;
+}
+
+message DeleteResponse {
+  uint64 id = 1;
+  bool deleted = 2;
+}
+
+message DeleteBatchRequest {
+  string collection = 1;
+  repeated uint64 ids = 2;
+}
+
+message DeleteBatchResponse {
+  uint32 deleted_count = 1;
+  uint32 requested_count = 2;
+}
+
+message UpdateRequest {
+  string collection = 1;
+  uint64 id = 2;
+  Vector vector = 3;
+  map<string, string> metadata = 4;
+}
+
+message UpdateResponse {
+  uint64 old_id = 1;
+  uint64 new_id = 2;
+  bool updated = 3;
+}
+
+message UpdateMetadataRequest {
+  string collection = 1;
+  uint64 id = 2;
+  map<string, string> metadata = 3;
+}
+
+message UpdateMetadataResponse {
+  uint64 id = 1;
+  bool updated = 2;
+}
+
+// ============================================================================
+// Snapshot Operations
+// ============================================================================
+
+message CreateSnapshotRequest {
+  string collection = 1;
+}
+
+message SnapshotInfo {
+  string name = 1;
+  string collection = 2;
+  string created_at = 3;  // ISO 8601 timestamp
+  uint64 vector_count = 4;
+  uint64 size_bytes = 5;
+}
+
+message ListSnapshotsRequest {
+  string collection = 1;
+}
+
+message ListSnapshotsResponse {
+  repeated SnapshotInfo snapshots = 1;
+}
+
+message RestoreSnapshotRequest {
+  string snapshot_name = 1;
+  string new_collection_name = 2;  // Optional, empty = use original name
+}
+
+message DeleteSnapshotRequest {
+  string snapshot_name = 1;
+}
+
+message DeleteSnapshotResponse {
+  bool success = 1;
 }

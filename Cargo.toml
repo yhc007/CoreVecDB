@@ -39,6 +39,7 @@ parking_lot = "0.12"
 rayon = "1.8"
 config = "0.13"
 lru = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
 
 [build-dependencies]
 tonic-build = "0.11"
