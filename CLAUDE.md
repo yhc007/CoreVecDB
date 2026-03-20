@@ -29,7 +29,9 @@ VectorDB is a Rust-based vector database with HNSW indexing, exposing both gRPC 
 
 1. **Storage** (`src/storage/mod.rs`)
    - `MemmapVectorStore`: Memory-mapped file for vector data (`data/vectors.bin`)
+   - `QuantizedMemmapVectorStore`: Scalar quantized storage (75% memory reduction)
    - `SledMetadataStore`: Embedded key-value store for metadata (`data/meta.sled`)
+   - `IndexedSledMetadataStore`: SledMetadataStore + PayloadIndex for fast filtering
    - Vectors are append-only; IDs are auto-assigned sequentially starting from 0
 
 2. **Index** (`src/index/mod.rs`)
@@ -38,7 +40,19 @@ VectorDB is a Rust-based vector database with HNSW indexing, exposing both gRPC 
    - Supports filtered search via `RoaringBitmap`
    - Index persists to `data/index.hnsw.*` files on shutdown
 
-3. **API** (`src/api/`)
+3. **Quantization** (`src/quantization/mod.rs`)
+   - `ScalarQuantizer`: float32 → uint8 compression (4x memory reduction)
+   - Online training: learns min/max per dimension incrementally
+   - Asymmetric distance: query in float32, candidates in uint8
+
+4. **Payload Index** (`src/payload/mod.rs`)
+   - `PayloadIndex`: Inverted index for metadata filtering
+   - `FieldIndex`: Per-field index using `RoaringBitmap` per unique value
+   - `FilterQuery` DSL: `Eq`, `In`, `And`, `Or`, `Not` operations
+   - Pre-filtering in HNSW search for indexed fields (O(1) bitmap lookup)
+   - Automatic fallback to post-filtering for non-indexed fields
+
+5. **API** (`src/api/`)
    - `mod.rs`: gRPC service implementation (`VectorServiceImpl`)
    - `http.rs`: Axum HTTP handlers mirroring gRPC functionality
    - Both share the same underlying service logic
@@ -62,6 +76,8 @@ Client → HTTP (port 3000) or gRPC (port 50051)
 `config.toml` controls:
 - `server.grpc_port`, `server.http_port`, `server.data_dir`
 - `index.dim` (vector dimension), `index.max_elements`, `index.m`, `index.ef_construction`
+- `quantization.enabled`, `quantization.keep_originals`, `quantization.rerank_oversample`
+- `payload.index_enabled`, `payload.indexed_fields` (list of fields to index)
 
 Environment override: `APP_SERVER__GRPC_PORT=50052` etc.
 
@@ -95,6 +111,74 @@ Environment override: `APP_SERVER__GRPC_PORT=50052` etc.
 ### ID Filtering
 - **`filter_ids`**: Uses `from_sorted_iter` for O(n) bitmap creation
 - **`filter_id_range`**: Uses `insert_range` for O(1) contiguous range filters
+
+## Scalar Quantization
+
+Reduces memory usage by 75% by compressing float32 vectors to uint8.
+
+### Configuration
+```toml
+[quantization]
+enabled = true
+keep_originals = false  # Set true for reranking with original vectors
+rerank_oversample = 3   # Fetch 3x candidates for reranking
+```
+
+### How It Works
+1. **Training**: Learns min/max per dimension online
+2. **Encoding**: `uint8 = (float32 - min) / (max - min) * 255`
+3. **Distance**: Asymmetric computation (query=float32, candidate=uint8)
+
+### Memory Comparison
+| Vectors | float32 | uint8 (quantized) | Savings |
+|---------|---------|-------------------|---------|
+| 10,000 | 5.12 MB | 1.28 MB | 75% |
+| 100,000 | 51.2 MB | 12.8 MB | 75% |
+| 1,000,000 | 512 MB | 128 MB | 75% |
+
+## Payload Index
+
+Inverted index for fast metadata filtering using Rust functional programming patterns.
+
+### Configuration
+```toml
+[payload]
+index_enabled = true
+indexed_fields = ["category", "type", "status"]
+```
+
+### FilterQuery DSL
+```rust
+// Equality
+FilterQuery::Eq { field: "category", value: "electronics" }
+
+// In (multiple values)
+FilterQuery::In { field: "status", values: vec!["active", "pending"] }
+
+// Logical operators
+FilterQuery::And(vec![...])
+FilterQuery::Or(vec![...])
+FilterQuery::Not(Box::new(...))
+```
+
+### Search Filtering Flow
+1. **Indexed fields**: Pre-filter with PayloadIndex → RoaringBitmap → HNSW search
+2. **Non-indexed fields**: HNSW search → Post-filter with metadata lookup
+3. **Combined**: Bitmap intersection for multiple filter types
+
+### Performance
+| Filter Type | Complexity | Notes |
+|-------------|------------|-------|
+| Indexed field (Eq) | O(1) | Bitmap lookup |
+| Indexed field (In) | O(k) | k = number of values |
+| Non-indexed field | O(N) | Post-filter scan |
+| Indexed + filter_ids | O(1) | Bitmap intersection |
+
+### Functional Programming Patterns Used
+- **Iterator chains**: `filter_map`, `fold`, `reduce`
+- **Pattern matching**: FilterQuery enum dispatch
+- **Closures**: Lazy evaluation in bitmap operations
+- **Option/Result monads**: Safe error handling
 
 ## Performance Benchmarks
 
