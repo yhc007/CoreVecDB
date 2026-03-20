@@ -17,3 +17,4 @@ rerank_oversample = 3
 [payload]
 index_enabled = true
 indexed_fields = ["category", "type", "status"]
+numeric_fields = ["price", "rating", "timestamp"]

@@ -38,8 +38,10 @@ pub struct QuantizationConfig {
 pub struct PayloadConfig {
     /// Enable payload indexing for fast filtering
     pub index_enabled: bool,
-    /// Fields to index (e.g., ["category", "status", "type"])
+    /// String fields to index (e.g., ["category", "status", "type"])
     pub indexed_fields: Vec<String>,
+    /// Numeric fields to index for range queries (e.g., ["price", "rating", "timestamp"])
+    pub numeric_fields: Vec<String>,
 }
 
 impl AppConfig {
@@ -58,6 +60,7 @@ impl AppConfig {
             .set_default("quantization.rerank_oversample", 3)?
             .set_default("payload.index_enabled", true)?
             .set_default::<&str, Vec<String>>("payload.indexed_fields", vec![])?
+            .set_default::<&str, Vec<String>>("payload.numeric_fields", vec![])?
             // Load from config file (optional)
             .add_source(File::with_name("config").required(false))
             // Load from environment variables (e.g. APP_SERVER__GRPC_PORT=50052)

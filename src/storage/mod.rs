@@ -353,14 +353,16 @@ impl MetadataStore for SledMetadataStore {
 
 /// Metadata store with inverted index for efficient filtering.
 /// Combines SledMetadataStore with PayloadIndex.
-/// Uses functional programming patterns throughout.
+/// Supports both string fields (exact match) and numeric fields (range queries).
 pub struct IndexedSledMetadataStore {
     /// Underlying storage
     inner: SledMetadataStore,
     /// Inverted index for fast filtering
     index: PayloadIndex,
-    /// Fields to index
+    /// String fields to index
     indexed_fields: Vec<String>,
+    /// Numeric fields to index
+    numeric_fields: Vec<String>,
 }
 
 impl IndexedSledMetadataStore {
@@ -378,6 +380,62 @@ impl IndexedSledMetadataStore {
             .collect();
 
         let index = PayloadIndex::with_fields(field_names.iter().map(|s| s.as_str()));
+
+        // Rebuild index from existing data
+        let rebuild_data: Vec<(u64, String, String)> = inner
+            .db
+            .iter()
+            .filter_map(|res| res.ok())
+            .filter_map(|(key, value)| {
+                let key_str = String::from_utf8(key.to_vec()).ok()?;
+                let value_str = String::from_utf8(value.to_vec()).ok()?;
+                let mut parts = key_str.splitn(2, ':');
+                let id: u64 = parts.next()?.parse().ok()?;
+                let field = parts.next()?.to_string();
+                Some((id, field, value_str))
+            })
+            .collect();
+
+        rebuild_data
+            .iter()
+            .filter(|(_, field, _)| field_names.contains(field))
+            .for_each(|(id, field, value)| {
+                index.insert(*id, field, value);
+            });
+
+        Ok(Self {
+            inner,
+            index,
+            indexed_fields: field_names,
+            numeric_fields: Vec::new(),
+        })
+    }
+
+    /// Create new indexed store with both string and numeric fields.
+    pub fn with_numeric_fields<I1, I2, S>(
+        path: &str,
+        indexed_fields: I1,
+        numeric_fields: I2,
+    ) -> Result<Self>
+    where
+        I1: IntoIterator<Item = S>,
+        I2: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let inner = SledMetadataStore::new(path)?;
+        let field_names: Vec<String> = indexed_fields
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+        let numeric_names: Vec<String> = numeric_fields
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+
+        let index = PayloadIndex::with_fields_and_numeric(
+            field_names.iter().map(|s| s.as_str()),
+            numeric_names.iter().map(|s| s.as_str()),
+        );
 
         // Rebuild index from existing data
         // Functional: scan DB and extract entries via iterator chain
@@ -398,8 +456,7 @@ impl IndexedSledMetadataStore {
             })
             .collect();
 
-        // Build index from collected data
-        // Functional: filter indexed fields and insert
+        // Build string index from collected data
         rebuild_data
             .iter()
             .filter(|(_, field, _)| field_names.contains(field))
@@ -407,18 +464,38 @@ impl IndexedSledMetadataStore {
                 index.insert(*id, field, value);
             });
 
+        // Build numeric index from collected data
+        // Attempts to parse value as f64 for numeric fields
+        rebuild_data
+            .iter()
+            .filter(|(_, field, _)| numeric_names.contains(field))
+            .for_each(|(id, field, value)| {
+                if let Ok(num) = value.parse::<f64>() {
+                    index.insert_numeric_f64(*id, field, num);
+                }
+            });
+
         Ok(Self {
             inner,
             index,
             indexed_fields: field_names,
+            numeric_fields: numeric_names,
         })
     }
 
-    /// Add a new field to index (for future inserts).
+    /// Add a new string field to index (for future inserts).
     pub fn add_indexed_field(&mut self, field: &str) {
         if !self.indexed_fields.contains(&field.to_string()) {
             self.indexed_fields.push(field.to_string());
             self.index.add_field(field);
+        }
+    }
+
+    /// Add a new numeric field to index (for future inserts).
+    pub fn add_numeric_field(&mut self, field: &str) {
+        if !self.numeric_fields.contains(&field.to_string()) {
+            self.numeric_fields.push(field.to_string());
+            self.index.add_numeric_field(field);
         }
     }
 
@@ -432,22 +509,34 @@ impl IndexedSledMetadataStore {
         self.index.stats()
     }
 
-    /// Check if a field is indexed.
+    /// Check if a string field is indexed.
     pub fn is_indexed(&self, field: &str) -> bool {
         self.index.is_indexed(field)
+    }
+
+    /// Check if a numeric field is indexed.
+    pub fn is_numeric_indexed(&self, field: &str) -> bool {
+        self.index.is_numeric_indexed(field)
     }
 }
 
 impl MetadataStore for IndexedSledMetadataStore {
     /// Insert with automatic index update.
     /// Functional: conditionally updates index based on field membership.
+    /// Handles both string and numeric fields.
     fn insert(&self, id: u64, key: String, value: String) -> Result<()> {
-        // Update index if field is indexed
-        // Functional: uses closure capture
-        self.indexed_fields
-            .iter()
-            .find(|f| *f == &key)
-            .map(|_| self.index.insert(id, &key, &value));
+        // Update string index if field is indexed
+        if self.indexed_fields.contains(&key) {
+            self.index.insert(id, &key, &value);
+        }
+
+        // Update numeric index if field is indexed
+        // Attempts to parse value as f64
+        if self.numeric_fields.contains(&key) {
+            if let Ok(num) = value.parse::<f64>() {
+                self.index.insert_numeric_f64(id, &key, num);
+            }
+        }
 
         // Delegate to inner store
         self.inner.insert(id, key, value)

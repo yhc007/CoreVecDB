@@ -42,10 +42,12 @@ async fn main() -> Result<()> {
     // Metadata store - use indexed or regular based on config
     let metadata_store: Arc<dyn MetadataStore> = if config.payload.index_enabled {
         println!("Using INDEXED metadata store");
-        println!("  - Indexed fields: {:?}", config.payload.indexed_fields);
-        Arc::new(IndexedSledMetadataStore::new(
+        println!("  - String indexed fields: {:?}", config.payload.indexed_fields);
+        println!("  - Numeric indexed fields: {:?}", config.payload.numeric_fields);
+        Arc::new(IndexedSledMetadataStore::with_numeric_fields(
             &meta_path,
             config.payload.indexed_fields.iter().map(|s| s.as_str()),
+            config.payload.numeric_fields.iter().map(|s| s.as_str()),
         )?)
     } else {
         println!("Using standard metadata store");
