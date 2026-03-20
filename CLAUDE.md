@@ -47,9 +47,10 @@ VectorDB is a Rust-based vector database with HNSW indexing, exposing both gRPC 
 
 4. **Payload Index** (`src/payload/mod.rs`)
    - `PayloadIndex`: Inverted index for metadata filtering
-   - `FieldIndex`: Per-field index using `RoaringBitmap` per unique value
-   - `FilterQuery` DSL: `Eq`, `In`, `And`, `Or`, `Not` operations
-   - Pre-filtering in HNSW search for indexed fields (O(1) bitmap lookup)
+   - `FieldIndex`: Per-field string index using `RoaringBitmap` per unique value
+   - `NumericFieldIndex`: BTreeMap-based index for range queries (O(log n))
+   - `FilterQuery` DSL: `Eq`, `In`, `Gt`, `Gte`, `Lt`, `Lte`, `Range`, `And`, `Or`, `Not`
+   - Pre-filtering in HNSW search for indexed fields
    - Automatic fallback to post-filtering for non-indexed fields
 
 5. **API** (`src/api/`)
@@ -77,7 +78,7 @@ Client → HTTP (port 3000) or gRPC (port 50051)
 - `server.grpc_port`, `server.http_port`, `server.data_dir`
 - `index.dim` (vector dimension), `index.max_elements`, `index.m`, `index.ef_construction`
 - `quantization.enabled`, `quantization.keep_originals`, `quantization.rerank_oversample`
-- `payload.index_enabled`, `payload.indexed_fields` (list of fields to index)
+- `payload.index_enabled`, `payload.indexed_fields`, `payload.numeric_fields`
 
 Environment override: `APP_SERVER__GRPC_PORT=50052` etc.
 
@@ -144,21 +145,59 @@ Inverted index for fast metadata filtering using Rust functional programming pat
 ```toml
 [payload]
 index_enabled = true
-indexed_fields = ["category", "type", "status"]
+indexed_fields = ["category", "type", "status"]  # String fields
+numeric_fields = ["price", "rating", "timestamp"] # Numeric fields (range queries)
 ```
 
 ### FilterQuery DSL
+
+#### String Filters
 ```rust
 // Equality
-FilterQuery::Eq { field: "category", value: "electronics" }
+FilterQuery::eq("category", "electronics")
 
 // In (multiple values)
-FilterQuery::In { field: "status", values: vec!["active", "pending"] }
+FilterQuery::in_set("status", ["active", "pending"])
+```
 
-// Logical operators
-FilterQuery::And(vec![...])
-FilterQuery::Or(vec![...])
-FilterQuery::Not(Box::new(...))
+#### Range Filters (Numeric)
+```rust
+// Greater than: price > 100
+FilterQuery::gt("price", 100)
+
+// Greater than or equal: price >= 100
+FilterQuery::gte("price", 100)
+
+// Less than: price < 500
+FilterQuery::lt("price", 500)
+
+// Less than or equal: price <= 500
+FilterQuery::lte("price", 500)
+
+// Range (inclusive): 100 <= price <= 500
+FilterQuery::range("price", 100, 500)
+
+// Float variants (auto-converts to i64 with 6 decimal precision)
+FilterQuery::gte_f("rating", 4.0)
+FilterQuery::range_f("score", 0.5, 0.95)
+```
+
+#### Logical Operators
+```rust
+// AND: category=electronics AND price < 300
+FilterQuery::and(vec![
+    FilterQuery::eq("category", "electronics"),
+    FilterQuery::lt("price", 300),
+])
+
+// OR: status=active OR status=pending
+FilterQuery::or(vec![
+    FilterQuery::eq("status", "active"),
+    FilterQuery::eq("status", "pending"),
+])
+
+// NOT (requires universe bitmap)
+FilterQuery::not(FilterQuery::eq("status", "deleted"))
 ```
 
 ### Search Filtering Flow
@@ -169,10 +208,11 @@ FilterQuery::Not(Box::new(...))
 ### Performance
 | Filter Type | Complexity | Notes |
 |-------------|------------|-------|
-| Indexed field (Eq) | O(1) | Bitmap lookup |
-| Indexed field (In) | O(k) | k = number of values |
+| String field (Eq) | O(1) | HashMap lookup |
+| String field (In) | O(k) | k = number of values |
+| Numeric range (Gt/Lt/Range) | O(log n + m) | BTreeMap range scan, m = matches |
 | Non-indexed field | O(N) | Post-filter scan |
-| Indexed + filter_ids | O(1) | Bitmap intersection |
+| Combined filters | O(1) | Bitmap intersection |
 
 ### Functional Programming Patterns Used
 - **Iterator chains**: `filter_map`, `fold`, `reduce`
