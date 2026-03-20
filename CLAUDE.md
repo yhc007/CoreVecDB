@@ -57,7 +57,7 @@ VectorDB is a Rust-based vector database with HNSW indexing, exposing both gRPC 
    - `http.rs`: Axum HTTP handlers mirroring gRPC functionality
    - Both share the same underlying service logic
 
-4. **Proto** (`src/proto/vectordb.proto`)
+6. **Proto** (`src/proto/vectordb.proto`)
    - Defines `VectorService` with `Upsert`, `Search`, `Get` RPCs
    - Compiled via `tonic-build` in `build.rs`
 
@@ -182,26 +182,38 @@ FilterQuery::Not(Box::new(...))
 
 ## Performance Benchmarks
 
-Tested with 128-dimensional vectors on Apple Silicon.
+Tested with 128-dimensional vectors, ~2000 vectors, Apple Silicon.
 
-### Throughput (20 concurrent threads)
-| Operation | ops/sec | Avg Latency |
-|-----------|---------|-------------|
-| GET | 5,589 | 3.44ms |
-| Search+Filter | 3,691 | 4.99ms |
-| Search | 3,337 | 5.58ms |
-| Upsert | 1,791 | 10.63ms |
+### Sequential Operations (Single Thread)
+| Operation | Throughput | Avg Latency | P99 |
+|-----------|------------|-------------|-----|
+| GET | 2,359 ops/s | 0.42ms | 1.22ms |
+| Search (no filter) | 1,388 ops/s | 0.72ms | 1.55ms |
+| Search + Non-indexed Filter | 1,521 ops/s | 0.66ms | 1.16ms |
+| Search + filter_ids (500) | 914 ops/s | 1.09ms | 4.76ms |
+| Search + filter_id_range | 804 ops/s | 1.24ms | 5.11ms |
+| Search + Indexed Filter | 640 ops/s | 1.56ms | 8.38ms |
+| Search + Multi Indexed | 440 ops/s | 2.27ms | 8.63ms |
+| Upsert | 712 ops/s | 1.41ms | 2.98ms |
 
-### Mixed Workload (90% read, 10% write)
-| Threads | Throughput |
-|---------|------------|
-| 10 | 3,252 ops/s |
-| 20 | 3,606 ops/s |
-| 50 | 3,287 ops/s |
+### Concurrent Operations (20 Threads)
+| Operation | Throughput | Avg Latency | P99 |
+|-----------|------------|-------------|-----|
+| Search (no filter) | 3,610 ops/s | 5.30ms | 11.77ms |
+| Mixed Workload (90R/10W) | 2,975 ops/s | 6.57ms | 16.89ms |
+| Search + Indexed Filter | 2,405 ops/s | 8.06ms | 16.67ms |
 
-### Sequential Operations
-| Operation | Latency | Throughput |
-|-----------|---------|------------|
-| GET | 0.36ms | 2,812/s |
-| Search | 0.78ms | 1,275/s |
-| Upsert | 1.69ms | 593/s |
+### Concurrent Scaling
+| Threads | Search Throughput | Search + Filter |
+|---------|-------------------|-----------------|
+| 10 | 2,946 ops/s | 2,207 ops/s |
+| 20 | 3,610 ops/s | 2,405 ops/s |
+
+### Benchmark Commands
+```bash
+# Basic benchmark
+python benchmark.py
+
+# Full benchmark with payload index tests
+python benchmark_full.py
+```
