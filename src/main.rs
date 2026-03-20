@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use vectordb::api::VectorServiceImpl;
 use vectordb::index::{HnswIndexer, DistanceMetric};
-use vectordb::storage::{MemmapVectorStore, QuantizedMemmapVectorStore, SledMetadataStore, VectorStore};
+use vectordb::storage::{MemmapVectorStore, QuantizedMemmapVectorStore, SledMetadataStore, IndexedSledMetadataStore, VectorStore, MetadataStore};
 use vectordb::proto::vectordb::vector_service_server::VectorServiceServer;
 use std::path::Path;
 use std::fs;
@@ -39,7 +39,18 @@ async fn main() -> Result<()> {
         println!("Using standard float32 storage");
         Arc::new(MemmapVectorStore::new(&format!("{}.bin", vector_path), dim)?)
     };
-    let metadata_store = Arc::new(SledMetadataStore::new(&meta_path)?);
+    // Metadata store - use indexed or regular based on config
+    let metadata_store: Arc<dyn MetadataStore> = if config.payload.index_enabled {
+        println!("Using INDEXED metadata store");
+        println!("  - Indexed fields: {:?}", config.payload.indexed_fields);
+        Arc::new(IndexedSledMetadataStore::new(
+            &meta_path,
+            config.payload.indexed_fields.iter().map(|s| s.as_str()),
+        )?)
+    } else {
+        println!("Using standard metadata store");
+        Arc::new(SledMetadataStore::new(&meta_path)?)
+    };
 
     // 2. Index
     // specific to hnsw-rs: it tries to load if exists, or create new.

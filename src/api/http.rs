@@ -102,45 +102,81 @@ async fn search(
     Json(payload): Json<JsonSearchReq>,
 ) -> Result<Json<JsonSearchResp>, StatusCode> {
 
-    // Build filter bitmap efficiently
-    let filter_bitmap = if let Some((start, end)) = payload.filter_id_range {
-        // Range filter is most efficient for contiguous IDs
-        Some(create_range_bitmap(start, end))
-    } else if let Some(ref ids) = payload.filter_ids {
-        if !ids.is_empty() {
-            Some(create_filter_bitmap(ids))
+    // Build filter bitmap efficiently - combine all filter sources
+    // Priority: payload index (fastest) > id range > explicit ids
+    let mut filter_bitmap: Option<roaring::RoaringBitmap> = None;
+
+    // 1. Try payload index pre-filtering (indexed fields)
+    //    Functional: collect conditions as Vec of refs, then try index
+    let has_metadata_filter = !payload.filter.is_empty();
+    let used_index_filter = if has_metadata_filter {
+        let conditions: Vec<(&str, &str)> = payload
+            .filter
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        if let Some(indexed_bitmap) = state.service.metadata_store.try_filter_and(&conditions) {
+            // Index hit - use pre-filtered IDs
+            filter_bitmap = Some(indexed_bitmap);
+            true
         } else {
-            None
+            false
         }
     } else {
-        None
+        false
     };
+
+    // 2. Combine with range filter if present
+    if let Some((start, end)) = payload.filter_id_range {
+        let range_bitmap = create_range_bitmap(start, end);
+        filter_bitmap = Some(
+            filter_bitmap
+                .map(|existing| existing & &range_bitmap)
+                .unwrap_or(range_bitmap)
+        );
+    }
+
+    // 3. Combine with explicit id filter if present
+    if let Some(ref ids) = payload.filter_ids {
+        if !ids.is_empty() {
+            let id_bitmap = create_filter_bitmap(ids);
+            filter_bitmap = Some(
+                filter_bitmap
+                    .map(|existing| existing & &id_bitmap)
+                    .unwrap_or(id_bitmap)
+            );
+        }
+    }
 
     let results = state.service.indexer.search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Filter logic same as gRPC
-    let mut final_results = Vec::new();
-    for (id, score) in results {
-        if !payload.filter.is_empty() {
-             let mut match_all = true;
-             for (fk, fv) in &payload.filter {
-                 if let Ok(val) = state.service.metadata_store.get(id, fk) {
-                     if val.as_deref() != Some(fv) {
-                         match_all = false;
-                         break;
-                     }
-                 } else {
-                      match_all = false;
-                      break;
-                 }
-             }
-             if !match_all {
-                 continue;
-             }
-        }
-        final_results.push(JsonSearchResult { id, score });
-    }
+    // Post-filter only if metadata filter exists AND index was not used
+    let final_results: Vec<JsonSearchResult> = if has_metadata_filter && !used_index_filter {
+        // Fallback: post-filter (for non-indexed fields)
+        results
+            .into_iter()
+            .filter(|(id, _)| {
+                payload.filter.iter().all(|(fk, fv)| {
+                    state.service.metadata_store
+                        .get(*id, fk)
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        .map(|v| v == fv)
+                        .unwrap_or(false)
+                })
+            })
+            .map(|(id, score)| JsonSearchResult { id, score })
+            .collect()
+    } else {
+        // No post-filter needed (either no metadata filter or index was used)
+        results
+            .into_iter()
+            .map(|(id, score)| JsonSearchResult { id, score })
+            .collect()
+    };
 
     Ok(Json(JsonSearchResp { results: final_results }))
 }

@@ -13,3 +13,7 @@ ef_construction = 400
 enabled = true
 keep_originals = false
 rerank_oversample = 3
+
+[payload]
+index_enabled = true
+indexed_fields = ["category", "type", "status"]

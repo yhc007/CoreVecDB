@@ -103,47 +103,67 @@ impl VectorService for VectorServiceImpl {
     async fn search(&self, request: Request<SearchRequest>) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
         let k = req.k as usize;
-        
+
         if let Some(vec) = req.vector {
-            let filter_bitmap = if !req.filter_ids.is_empty() {
-                Some(create_filter_bitmap(&req.filter_ids))
+            // Build filter bitmap - try payload index first, then explicit IDs
+            let has_metadata_filter = !req.filter.is_empty();
+
+            // Try payload index pre-filtering (functional style)
+            let (filter_bitmap, used_index_filter) = if has_metadata_filter {
+                let conditions: Vec<(&str, &str)> = req
+                    .filter
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+
+                if let Some(indexed_bitmap) = self.metadata_store.try_filter_and(&conditions) {
+                    // Combine with explicit filter_ids if present
+                    let combined = if !req.filter_ids.is_empty() {
+                        let id_bitmap = create_filter_bitmap(&req.filter_ids);
+                        indexed_bitmap & id_bitmap
+                    } else {
+                        indexed_bitmap
+                    };
+                    (Some(combined), true)
+                } else if !req.filter_ids.is_empty() {
+                    (Some(create_filter_bitmap(&req.filter_ids)), false)
+                } else {
+                    (None, false)
+                }
+            } else if !req.filter_ids.is_empty() {
+                (Some(create_filter_bitmap(&req.filter_ids)), false)
             } else {
-                None
+                (None, false)
             };
-            
+
             let results = self.indexer.search(&vec.elements, k, filter_bitmap.as_ref())
                 .map_err(|e| Status::internal(format!("Search error: {}", e)))?;
-            
-            // Post-filtering with Rayon (Functional & Parallel)
-            // We collect results into a Vec first, then par_iter to filter.
-            // Since `search` is async and `rayon` is blocking CPU work, 
-            // strictly speaking we should use `spawn_blocking` if it takes too long,
-            // but for this granular work (metadata lookup) it might be fine or we verify perf.
-            
+
+            // Post-filtering only if metadata filter exists AND index was not used
             use rayon::prelude::*;
-            
-            let filtered_results: Vec<SearchResult> = if !req.filter.is_empty() {
-                // Rayon requires the closure to be Send + Sync.
-                // Our metadata_store is Arc<dyn MetadataStore> which should be, 
-                // but SledMetadataStore needs to handle concurrent reads (which it does).
+
+            let filtered_results: Vec<SearchResult> = if has_metadata_filter && !used_index_filter {
+                // Fallback: parallel post-filter for non-indexed fields
                 results.into_par_iter()
                     .filter_map(|(id, score)| {
-                         // Check all filters
-                         for (fk, fv) in &req.filter {
-                             // Note: get() might block, which is not ideal in async fn if prolonged,
-                             // but we are aiming for throughput here.
-                             match self.metadata_store.get(id, fk) {
-                                 Ok(Some(val)) if val == *fv => {},
-                                 _ => return None,
-                             }
-                         }
-                         Some(SearchResult { id, score })
+                        // Functional: all conditions must match
+                        let matches = req.filter.iter().all(|(fk, fv)| {
+                            self.metadata_store
+                                .get(id, fk)
+                                .ok()
+                                .flatten()
+                                .as_ref()
+                                .map(|v| v == fv)
+                                .unwrap_or(false)
+                        });
+                        if matches { Some(SearchResult { id, score }) } else { None }
                     })
                     .collect()
             } else {
-                 results.into_iter().map(|(id, score)| SearchResult { id, score }).collect()
+                // No post-filter needed
+                results.into_iter().map(|(id, score)| SearchResult { id, score }).collect()
             };
-            
+
             Ok(Response::new(SearchResponse {
                 results: filtered_results,
             }))

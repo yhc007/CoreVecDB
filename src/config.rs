@@ -6,6 +6,7 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub index: IndexConfig,
     pub quantization: QuantizationConfig,
+    pub payload: PayloadConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -33,6 +34,14 @@ pub struct QuantizationConfig {
     pub rerank_oversample: usize,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct PayloadConfig {
+    /// Enable payload indexing for fast filtering
+    pub index_enabled: bool,
+    /// Fields to index (e.g., ["category", "status", "type"])
+    pub indexed_fields: Vec<String>,
+}
+
 impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
         let builder = Config::builder()
@@ -47,6 +56,8 @@ impl AppConfig {
             .set_default("quantization.enabled", false)?
             .set_default("quantization.keep_originals", true)?
             .set_default("quantization.rerank_oversample", 3)?
+            .set_default("payload.index_enabled", true)?
+            .set_default::<&str, Vec<String>>("payload.indexed_fields", vec![])?
             // Load from config file (optional)
             .add_source(File::with_name("config").required(false))
             // Load from environment variables (e.g. APP_SERVER__GRPC_PORT=50052)

@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use lru::LruCache;
 
 use crate::quantization::{ScalarQuantizer, QuantizerStats};
+use crate::payload::{PayloadIndex, FilterQuery, PayloadIndexFullStats};
+use roaring::RoaringBitmap;
 
 /// Trait for storing vectors
 pub trait VectorStore: Send + Sync {
@@ -24,6 +26,25 @@ pub trait VectorStore: Send + Sync {
 pub trait MetadataStore: Send + Sync {
     fn insert(&self, id: u64, key: String, value: String) -> Result<()>;
     fn get(&self, id: u64, key: &str) -> Result<Option<String>>;
+
+    /// Try to filter by key-value conditions using payload index.
+    /// Returns None if indexing is not available (will fallback to post-filter).
+    /// Returns Some(bitmap) with matching IDs if index is available.
+    fn try_filter_and(&self, _conditions: &[(&str, &str)]) -> Option<RoaringBitmap> {
+        None // Default: no indexing available
+    }
+}
+
+/// Extended trait for indexed metadata store
+pub trait IndexedMetadata: MetadataStore {
+    /// Filter by metadata conditions, returns matching IDs
+    fn filter(&self, query: &FilterQuery) -> Option<RoaringBitmap>;
+
+    /// Filter by simple key-value conditions (AND)
+    fn filter_and(&self, conditions: &[(&str, &str)]) -> Option<RoaringBitmap>;
+
+    /// Get index statistics
+    fn index_stats(&self) -> PayloadIndexFullStats;
 }
 
 const WRITE_BUFFER_SIZE: usize = 256; // Flush after 256 vectors
@@ -323,6 +344,144 @@ impl MetadataStore for SledMetadataStore {
         }
 
         Ok(result)
+    }
+}
+
+// ============================================================================
+// Indexed Metadata Store (with PayloadIndex)
+// ============================================================================
+
+/// Metadata store with inverted index for efficient filtering.
+/// Combines SledMetadataStore with PayloadIndex.
+/// Uses functional programming patterns throughout.
+pub struct IndexedSledMetadataStore {
+    /// Underlying storage
+    inner: SledMetadataStore,
+    /// Inverted index for fast filtering
+    index: PayloadIndex,
+    /// Fields to index
+    indexed_fields: Vec<String>,
+}
+
+impl IndexedSledMetadataStore {
+    /// Create new indexed store with specified fields to index.
+    /// Functional: uses iterator to configure fields.
+    pub fn new<I, S>(path: &str, indexed_fields: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let inner = SledMetadataStore::new(path)?;
+        let field_names: Vec<String> = indexed_fields
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+
+        let index = PayloadIndex::with_fields(field_names.iter().map(|s| s.as_str()));
+
+        // Rebuild index from existing data
+        // Functional: scan DB and extract entries via iterator chain
+        let rebuild_data: Vec<(u64, String, String)> = inner
+            .db
+            .iter()
+            .filter_map(|res| res.ok())
+            .filter_map(|(key, value)| {
+                let key_str = String::from_utf8(key.to_vec()).ok()?;
+                let value_str = String::from_utf8(value.to_vec()).ok()?;
+
+                // Parse "id:field" format
+                let mut parts = key_str.splitn(2, ':');
+                let id: u64 = parts.next()?.parse().ok()?;
+                let field = parts.next()?.to_string();
+
+                Some((id, field, value_str))
+            })
+            .collect();
+
+        // Build index from collected data
+        // Functional: filter indexed fields and insert
+        rebuild_data
+            .iter()
+            .filter(|(_, field, _)| field_names.contains(field))
+            .for_each(|(id, field, value)| {
+                index.insert(*id, field, value);
+            });
+
+        Ok(Self {
+            inner,
+            index,
+            indexed_fields: field_names,
+        })
+    }
+
+    /// Add a new field to index (for future inserts).
+    pub fn add_indexed_field(&mut self, field: &str) {
+        if !self.indexed_fields.contains(&field.to_string()) {
+            self.indexed_fields.push(field.to_string());
+            self.index.add_field(field);
+        }
+    }
+
+    /// Get cache statistics from inner store.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        self.inner.cache_stats()
+    }
+
+    /// Get index statistics.
+    pub fn index_stats(&self) -> PayloadIndexFullStats {
+        self.index.stats()
+    }
+
+    /// Check if a field is indexed.
+    pub fn is_indexed(&self, field: &str) -> bool {
+        self.index.is_indexed(field)
+    }
+}
+
+impl MetadataStore for IndexedSledMetadataStore {
+    /// Insert with automatic index update.
+    /// Functional: conditionally updates index based on field membership.
+    fn insert(&self, id: u64, key: String, value: String) -> Result<()> {
+        // Update index if field is indexed
+        // Functional: uses closure capture
+        self.indexed_fields
+            .iter()
+            .find(|f| *f == &key)
+            .map(|_| self.index.insert(id, &key, &value));
+
+        // Delegate to inner store
+        self.inner.insert(id, key, value)
+    }
+
+    fn get(&self, id: u64, key: &str) -> Result<Option<String>> {
+        self.inner.get(id, key)
+    }
+
+    /// Pre-filter using payload index.
+    /// Returns matching IDs as RoaringBitmap for efficient HNSW filtering.
+    fn try_filter_and(&self, conditions: &[(&str, &str)]) -> Option<RoaringBitmap> {
+        if conditions.is_empty() {
+            return None;
+        }
+        self.index.filter_and(conditions.iter().copied())
+    }
+}
+
+impl IndexedMetadata for IndexedSledMetadataStore {
+    /// Filter using PayloadIndex.
+    /// Functional: delegates to index's filter.
+    fn filter(&self, query: &FilterQuery) -> Option<RoaringBitmap> {
+        self.index.filter(query)
+    }
+
+    /// Filter by simple AND conditions.
+    /// Functional: transforms slice to iterator of tuples.
+    fn filter_and(&self, conditions: &[(&str, &str)]) -> Option<RoaringBitmap> {
+        self.index.filter_and(conditions.iter().copied())
+    }
+
+    fn index_stats(&self) -> PayloadIndexFullStats {
+        self.index.stats()
     }
 }
 
