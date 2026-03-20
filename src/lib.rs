@@ -1,4 +1,5 @@
 pub mod api;
+pub mod collection;
 pub mod config;
 pub mod index;
 pub mod payload;

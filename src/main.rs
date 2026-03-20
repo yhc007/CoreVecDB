@@ -1,12 +1,8 @@
 use anyhow::Result;
 use std::sync::Arc;
-use tonic::transport::Server;
-use vectordb::api::VectorServiceImpl;
-use vectordb::index::{HnswIndexer, DistanceMetric};
-use vectordb::storage::{MemmapVectorStore, QuantizedMemmapVectorStore, SledMetadataStore, IndexedSledMetadataStore, VectorStore, MetadataStore};
-use vectordb::proto::vectordb::vector_service_server::VectorServiceServer;
 use std::path::Path;
-use std::fs;
+use vectordb::collection::CollectionManager;
+use vectordb::config::AppConfig;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -14,105 +10,44 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     // Load configuration
-    use vectordb::config::AppConfig;
     let config = AppConfig::load()?;
     println!("Configuration loaded: {:?}", config);
 
-    let data_dir = &config.server.data_dir;
-    fs::create_dir_all(data_dir)?;
+    let data_dir = Path::new(&config.server.data_dir);
 
-    let vector_path = format!("{}/vectors", data_dir);
-    let index_path = format!("{}/index.hnsw", data_dir);
-    let meta_path = format!("{}/meta.sled", data_dir);
+    // Create collection manager
+    let manager = Arc::new(CollectionManager::new(data_dir)?);
+    println!("Collection manager initialized");
+    println!("  - Collections: {:?}", manager.names());
 
-    // 1. Storage - use quantized or regular based on config
-    let dim = config.index.dim;
-    let vector_store: Arc<dyn VectorStore> = if config.quantization.enabled {
-        println!("Using QUANTIZED storage (75% memory savings)");
-        println!("  - Keep originals for reranking: {}", config.quantization.keep_originals);
-        Arc::new(QuantizedMemmapVectorStore::new(
-            &vector_path,
-            dim,
-            config.quantization.keep_originals,
-        )?)
-    } else {
-        println!("Using standard float32 storage");
-        Arc::new(MemmapVectorStore::new(&format!("{}.bin", vector_path), dim)?)
-    };
-    // Metadata store - use indexed or regular based on config
-    let metadata_store: Arc<dyn MetadataStore> = if config.payload.index_enabled {
-        println!("Using INDEXED metadata store");
-        println!("  - String indexed fields: {:?}", config.payload.indexed_fields);
-        println!("  - Numeric indexed fields: {:?}", config.payload.numeric_fields);
-        Arc::new(IndexedSledMetadataStore::with_numeric_fields(
-            &meta_path,
-            config.payload.indexed_fields.iter().map(|s| s.as_str()),
-            config.payload.numeric_fields.iter().map(|s| s.as_str()),
-        )?)
-    } else {
-        println!("Using standard metadata store");
-        Arc::new(SledMetadataStore::new(&meta_path)?)
-    };
-
-    // 2. Index
-    // specific to hnsw-rs: it tries to load if exists, or create new.
-    // My wrapper `load` and `new` are separate.
-    let graph_path = format!("{}.hnsw.graph", index_path);
-    let indexer = if Path::new(&graph_path).exists() {
-        println!("Loading index from {}", index_path);
-        Arc::new(HnswIndexer::load(Path::new(&index_path), dim, DistanceMetric::Euclidean)?)
-    } else {
-        println!("Creating new index");
-        Arc::new(HnswIndexer::new(dim, config.index.max_elements, config.index.m, config.index.ef_construction))
-    };
-
-    // 3. Service
-    let service = VectorServiceImpl::new(
-        vector_store.clone(),
-        metadata_store.clone(),
-        indexer.clone(),
-    );
-
-    // 4. Server
-    let addr = format!("0.0.0.0:{}", config.server.grpc_port).parse()?;
-    println!("VectorDB gRPC listening on {}", addr);
-
-    let http_service = service.clone();
-
-    // Spawn HTTP Server
-    let http_router = vectordb::api::http::router(Arc::new(http_service)).await;
+    // HTTP Server with multi-collection support
+    let http_router = vectordb::api::http::collection_router(manager.clone()).await;
     let http_addr = format!("0.0.0.0:{}", config.server.http_port);
     println!("VectorDB HTTP listening on {}", http_addr);
-    
+
     let http_handle = tokio::spawn(async move {
-        // Need to parse socket addr for Axum serve, assuming 0.0.0.0
         let listener = tokio::net::TcpListener::bind(&http_addr).await.unwrap();
         axum::serve(listener, http_router).await.unwrap();
     });
 
-    Server::builder()
-        .add_service(VectorServiceServer::new(service))
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
-        
+    // Wait for shutdown signal
+    shutdown_signal().await;
+
     println!("Shutting down...");
 
-    // Flush buffered writes
-    if let Err(e) = vector_store.flush() {
-        eprintln!("Failed to flush vector store: {:?}", e);
+    // Flush all collections
+    if let Err(e) = manager.flush_all() {
+        eprintln!("Failed to flush collections: {:?}", e);
     } else {
-        println!("Vector store flushed successfully.");
+        println!("All collections flushed successfully.");
     }
 
-    // Save index
-    println!("Saving index to {}", index_path);
-    if let Err(e) = indexer.save(Path::new(&index_path)) {
-        eprintln!("Failed to save index: {:?}", e);
-    } else {
-        println!("Index saved successfully.");
+    // Save all indexes
+    if let Err(e) = manager.save_all_indexes() {
+        eprintln!("Failed to save indexes: {:?}", e);
     }
-    
-    // Abort HTTP if gRPC finishes (HTTP server runs in background)
+
+    // Abort HTTP server
     http_handle.abort();
 
     Ok(())
