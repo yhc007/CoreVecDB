@@ -13,6 +13,10 @@ service VectorService {
   rpc Upsert (UpsertRequest) returns (UpsertResponse);
   rpc UpsertBatch (UpsertBatchRequest) returns (UpsertBatchResponse);
   rpc Search (SearchRequest) returns (SearchResponse);
+
+  // Streaming operations
+  rpc StreamUpsert (stream StreamUpsertRequest) returns (StreamUpsertResponse);
+  rpc StreamUpsertBidi (stream StreamUpsertRequest) returns (stream StreamUpsertProgress);
   rpc Get (GetRequest) returns (GetResponse);
   rpc Delete (DeleteRequest) returns (DeleteResponse);
   rpc DeleteBatch (DeleteBatchRequest) returns (DeleteBatchResponse);
@@ -24,6 +28,13 @@ service VectorService {
   rpc ListSnapshots (ListSnapshotsRequest) returns (ListSnapshotsResponse);
   rpc RestoreSnapshot (RestoreSnapshotRequest) returns (CollectionInfo);
   rpc DeleteSnapshot (DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
+
+  // Maintenance operations
+  rpc Compact (CompactRequest) returns (CompactResponse);
+
+  // Replication operations
+  rpc GetReplicationStatus (ReplicationStatusRequest) returns (ReplicationStatusResponse);
+  rpc GetWalEntries (GetWalEntriesRequest) returns (GetWalEntriesResponse);
 }
 
 // ============================================================================
@@ -107,6 +118,31 @@ message UpsertBatchResponse {
   uint64 start_id = 1;
   uint32 count = 2;
   bool success = 3;
+}
+
+// Streaming upsert - send vectors in chunks
+message StreamUpsertRequest {
+  string collection = 1;        // Collection name (set in first message)
+  repeated BatchVector vectors = 2;  // Chunk of vectors
+  bool is_last = 3;             // True if this is the last chunk
+}
+
+// Final response after all vectors are inserted
+message StreamUpsertResponse {
+  uint64 total_inserted = 1;
+  uint64 start_id = 2;
+  uint64 end_id = 3;
+  bool success = 4;
+  string error = 5;
+}
+
+// Progress update during bidirectional streaming
+message StreamUpsertProgress {
+  uint64 inserted_so_far = 1;
+  uint64 current_chunk_start_id = 2;
+  uint32 current_chunk_count = 3;
+  float progress_percent = 4;    // 0-100
+  bool is_complete = 5;
 }
 
 message SearchRequest {
@@ -226,4 +262,55 @@ message DeleteSnapshotRequest {
 
 message DeleteSnapshotResponse {
   bool success = 1;
+}
+
+// ============================================================================
+// Maintenance Operations
+// ============================================================================
+
+message CompactRequest {
+  string collection = 1;
+}
+
+message CompactResponse {
+  uint64 vectors_before = 1;
+  uint64 vectors_after = 2;
+  uint64 vectors_removed = 3;
+  uint64 bytes_reclaimed = 4;
+  bool success = 5;
+}
+
+// ============================================================================
+// Replication Operations
+// ============================================================================
+
+message ReplicationStatusRequest {}
+
+message ReplicationStatusResponse {
+  string role = 1;              // "primary", "replica", "standalone"
+  uint64 current_seq = 2;       // Current WAL sequence number
+  uint64 wal_entries = 3;       // Total WAL entries
+  uint64 wal_size_bytes = 4;    // Total WAL size
+  string replica_status = 5;    // For replicas: sync status
+  string primary_addr = 6;      // For replicas: primary address
+  uint64 last_synced_seq = 7;   // For replicas: last synced sequence
+}
+
+message GetWalEntriesRequest {
+  uint64 from_seq = 1;          // Get entries after this sequence number
+  uint32 max_entries = 2;       // Maximum entries to return (0 = all)
+}
+
+message WalEntryProto {
+  uint64 seq = 1;
+  string timestamp = 2;         // ISO 8601
+  string operation_type = 3;    // "insert", "delete", etc.
+  string collection = 4;
+  bytes operation_data = 5;     // JSON-encoded operation details
+}
+
+message GetWalEntriesResponse {
+  repeated WalEntryProto entries = 1;
+  uint64 current_seq = 2;       // Current sequence number on server
+  bool has_more = 3;            // True if more entries available
 }

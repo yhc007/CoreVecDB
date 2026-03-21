@@ -2,12 +2,17 @@ use axum::{
     routing::{get, post, delete, put, patch},
     Router, Json, extract::{State, Path},
     http::StatusCode,
+    response::sse::{Event, Sse},
 };
 use std::sync::Arc;
+use std::convert::Infallible;
+use futures::stream::Stream;
 use crate::api::{create_filter_bitmap, create_range_bitmap};
 use crate::collection::{CollectionManager, CollectionConfig, CollectionInfo, SnapshotInfo};
-use crate::storage::{MetadataEntry, IndexedMetadata};
+use crate::storage::{VectorStore, MetadataEntry, IndexedMetadata};
 use crate::payload::FilterQuery;
+use crate::replication::{ReplicationManager, ReplicationRole};
+use crate::metrics;
 use serde::{Deserialize, Serialize};
 
 // Wrapper structs for JSON compatibility if proto structs don't behave well with Serde automatically
@@ -154,6 +159,7 @@ pub struct JsonSearchResult {
 /// State for collection-aware router.
 pub struct CollectionAppState {
     pub manager: Arc<CollectionManager>,
+    pub replication: Option<Arc<ReplicationManager>>,
 }
 
 /// Request to create a new collection.
@@ -173,7 +179,15 @@ pub struct CreateCollectionReq {
 
 /// Create router with multi-collection support.
 pub async fn collection_router(manager: Arc<CollectionManager>) -> Router {
-    let state = Arc::new(CollectionAppState { manager });
+    collection_router_with_replication(manager, None).await
+}
+
+/// Create router with multi-collection and replication support.
+pub async fn collection_router_with_replication(
+    manager: Arc<CollectionManager>,
+    replication: Option<Arc<ReplicationManager>>,
+) -> Router {
+    let state = Arc::new(CollectionAppState { manager, replication });
 
     Router::new()
         // Collection management
@@ -190,11 +204,20 @@ pub async fn collection_router(manager: Arc<CollectionManager>) -> Router {
         .route("/collections/:name/vectors/:id", patch(collection_update_metadata))
         .route("/collections/:name/vectors/:id", delete(collection_delete_vector))
         .route("/collections/:name/delete_batch", post(collection_delete_batch))
+        // Streaming upsert with progress (SSE)
+        .route("/collections/:name/stream_upsert", post(collection_stream_upsert))
         // Snapshot operations
         .route("/collections/:name/snapshots", get(list_snapshots))
         .route("/collections/:name/snapshots", post(create_snapshot))
         .route("/snapshots/:snapshot_name", delete(delete_snapshot))
         .route("/snapshots/:snapshot_name/restore", post(restore_snapshot))
+        // Maintenance operations
+        .route("/collections/:name/compact", post(collection_compact))
+        // Replication status
+        .route("/replication/status", get(replication_status))
+        .route("/replication/wal", get(get_wal_entries))
+        // Metrics
+        .route("/metrics", get(prometheus_metrics))
         // Legacy routes (use default collection)
         .route("/upsert", post(legacy_upsert))
         .route("/upsert_batch", post(legacy_upsert_batch))
@@ -576,6 +599,147 @@ async fn collection_delete_batch(
     })))
 }
 
+/// Streaming progress event.
+#[derive(Serialize)]
+pub struct StreamProgress {
+    pub inserted_so_far: u64,
+    pub current_chunk_start_id: u64,
+    pub current_chunk_count: u32,
+    pub progress_percent: f32,
+    pub is_complete: bool,
+}
+
+/// Streaming upsert request body.
+#[derive(Deserialize)]
+pub struct StreamUpsertReq {
+    pub vectors: Vec<BatchVectorReq>,
+    pub chunk_size: Option<usize>,  // Optional chunk size (default: 1000)
+}
+
+/// Streaming upsert with SSE progress updates.
+/// Processes large batches in chunks and streams progress back.
+async fn collection_stream_upsert(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<StreamUpsertReq>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let chunk_size = payload.chunk_size.unwrap_or(1000);
+    let total_vectors = payload.vectors.len();
+
+    // Create async stream for SSE
+    let stream = async_stream::stream! {
+        let mut total_inserted: u64 = 0;
+        let mut first_chunk = true;
+        let mut start_id: u64 = 0;
+
+        for chunk in payload.vectors.chunks(chunk_size) {
+            // Extract vectors
+            let vectors: Vec<Vec<f32>> = chunk
+                .iter()
+                .map(|v| v.vector.clone())
+                .collect();
+
+            if vectors.is_empty() {
+                continue;
+            }
+
+            // Batch insert to vector store
+            let chunk_start_id = match collection.vector_store.insert_batch(&vectors) {
+                Ok(id) => id,
+                Err(e) => {
+                    let err_event = Event::default()
+                        .event("error")
+                        .data(format!("Storage error: {}", e));
+                    yield Ok(err_event);
+                    return;
+                }
+            };
+
+            if first_chunk {
+                start_id = chunk_start_id;
+                first_chunk = false;
+            }
+
+            // Prepare index data
+            let index_data: Vec<(u64, Vec<f32>)> = vectors
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (chunk_start_id + i as u64, v))
+                .collect();
+
+            // Batch insert to HNSW index
+            if let Err(e) = collection.indexer.insert_batch(&index_data) {
+                let err_event = Event::default()
+                    .event("error")
+                    .data(format!("Index error: {}", e));
+                yield Ok(err_event);
+                return;
+            }
+
+            // Collect metadata entries
+            let metadata_entries: Vec<MetadataEntry> = chunk
+                .iter()
+                .enumerate()
+                .flat_map(|(i, v)| {
+                    let id = chunk_start_id + i as u64;
+                    v.metadata.iter().map(move |(k, val)| MetadataEntry {
+                        id,
+                        key: k.clone(),
+                        value: val.clone(),
+                    })
+                })
+                .collect();
+
+            if !metadata_entries.is_empty() {
+                if let Err(e) = collection.metadata_store.insert_batch(&metadata_entries) {
+                    let err_event = Event::default()
+                        .event("error")
+                        .data(format!("Metadata error: {}", e));
+                    yield Ok(err_event);
+                    return;
+                }
+            }
+
+            total_inserted += chunk.len() as u64;
+            let progress_percent = (total_inserted as f32 / total_vectors as f32) * 100.0;
+            let is_complete = total_inserted >= total_vectors as u64;
+
+            let progress = StreamProgress {
+                inserted_so_far: total_inserted,
+                current_chunk_start_id: chunk_start_id,
+                current_chunk_count: chunk.len() as u32,
+                progress_percent,
+                is_complete,
+            };
+
+            let event = Event::default()
+                .event("progress")
+                .data(serde_json::to_string(&progress).unwrap_or_default());
+
+            yield Ok(event);
+        }
+
+        // Final completion event
+        let complete = serde_json::json!({
+            "total_inserted": total_inserted,
+            "start_id": start_id,
+            "collection": name,
+            "success": true
+        });
+
+        let done_event = Event::default()
+            .event("complete")
+            .data(serde_json::to_string(&complete).unwrap_or_default());
+
+        yield Ok(done_event);
+    };
+
+    Ok(Sse::new(stream))
+}
+
 /// Update a vector (delete old + insert new).
 /// Returns the new ID since vectors are append-only.
 async fn collection_update_vector(
@@ -648,6 +812,45 @@ async fn collection_update_metadata(
         "collection": name,
         "updated": true
     })))
+}
+
+// ============================================================================
+// Compaction Handler
+// ============================================================================
+
+/// Compact response.
+#[derive(Serialize)]
+pub struct CompactResp {
+    pub collection: String,
+    pub vectors_before: usize,
+    pub vectors_after: usize,
+    pub vectors_removed: usize,
+    pub bytes_reclaimed: u64,
+    pub success: bool,
+}
+
+/// Compact a collection by removing deleted vectors.
+/// This operation rebuilds the index and may take time for large collections.
+///
+/// WARNING: All vector IDs will change after compaction.
+async fn collection_compact(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<CompactResp>, StatusCode> {
+    let result = state.manager.compact(&name)
+        .map_err(|e| {
+            eprintln!("Compaction error: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(CompactResp {
+        collection: name,
+        vectors_before: result.vectors_before,
+        vectors_after: result.vectors_after,
+        vectors_removed: result.vectors_removed,
+        bytes_reclaimed: result.bytes_reclaimed,
+        success: true,
+    }))
 }
 
 // ============================================================================
@@ -958,4 +1161,186 @@ async fn legacy_stats(
         "collection": collection.name(),
         "status": "Ready"
     })))
+}
+
+// ============================================================================
+// Replication Handlers
+// ============================================================================
+
+/// Replication status response.
+#[derive(Serialize)]
+pub struct ReplicationStatusResp {
+    pub role: String,
+    pub current_seq: u64,
+    pub wal_entries: usize,
+    pub wal_size_bytes: u64,
+    pub replica_status: Option<String>,
+    pub primary_addr: Option<String>,
+    pub last_synced_seq: Option<u64>,
+}
+
+/// Get replication status.
+async fn replication_status(
+    State(state): State<Arc<CollectionAppState>>,
+) -> Json<ReplicationStatusResp> {
+    if let Some(ref replication) = state.replication {
+        let status = replication.status();
+        let role_str = match status.role {
+            ReplicationRole::Primary => "primary",
+            ReplicationRole::Replica => "replica",
+            ReplicationRole::Standalone => "standalone",
+        };
+
+        let (wal_entries, wal_size) = status.wal_stats
+            .map(|s| (s.total_entries, s.total_size_bytes))
+            .unwrap_or((0, 0));
+
+        let (replica_status, primary_addr, last_seq) = status.replica_state
+            .map(|s| (Some(format!("{:?}", s.status)), Some(s.primary_addr), Some(s.last_seq)))
+            .unwrap_or((None, None, None));
+
+        Json(ReplicationStatusResp {
+            role: role_str.to_string(),
+            current_seq: status.current_seq,
+            wal_entries,
+            wal_size_bytes: wal_size,
+            replica_status,
+            primary_addr,
+            last_synced_seq: last_seq,
+        })
+    } else {
+        Json(ReplicationStatusResp {
+            role: "standalone".to_string(),
+            current_seq: 0,
+            wal_entries: 0,
+            wal_size_bytes: 0,
+            replica_status: None,
+            primary_addr: None,
+            last_synced_seq: None,
+        })
+    }
+}
+
+/// WAL entries query parameters.
+#[derive(Deserialize)]
+pub struct WalEntriesQuery {
+    #[serde(default)]
+    pub from_seq: u64,
+    #[serde(default = "default_max_entries")]
+    pub max_entries: usize,
+}
+
+fn default_max_entries() -> usize {
+    1000
+}
+
+/// WAL entry response.
+#[derive(Serialize)]
+pub struct WalEntryResp {
+    pub seq: u64,
+    pub timestamp: String,
+    pub operation_type: String,
+    pub collection: String,
+}
+
+/// Get WAL entries response.
+#[derive(Serialize)]
+pub struct WalEntriesResp {
+    pub entries: Vec<WalEntryResp>,
+    pub current_seq: u64,
+    pub has_more: bool,
+}
+
+/// Get WAL entries for replication.
+async fn get_wal_entries(
+    State(state): State<Arc<CollectionAppState>>,
+    axum::extract::Query(query): axum::extract::Query<WalEntriesQuery>,
+) -> Result<Json<WalEntriesResp>, StatusCode> {
+    if let Some(ref replication) = state.replication {
+        let entries = replication.get_entries_from(query.from_seq)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let current_seq = replication.current_seq();
+        let total_entries = entries.len();
+        let has_more = total_entries > query.max_entries;
+
+        let entries: Vec<WalEntryResp> = entries
+            .into_iter()
+            .take(query.max_entries)
+            .map(|e| {
+                let (op_type, collection) = match &e.operation {
+                    crate::replication::WalOperation::Insert { collection, .. } => ("insert", collection.clone()),
+                    crate::replication::WalOperation::InsertBatch { collection, .. } => ("insert_batch", collection.clone()),
+                    crate::replication::WalOperation::Delete { collection, .. } => ("delete", collection.clone()),
+                    crate::replication::WalOperation::DeleteBatch { collection, .. } => ("delete_batch", collection.clone()),
+                    crate::replication::WalOperation::Update { collection, .. } => ("update", collection.clone()),
+                    crate::replication::WalOperation::UpdateMetadata { collection, .. } => ("update_metadata", collection.clone()),
+                    crate::replication::WalOperation::CreateCollection { name, .. } => ("create_collection", name.clone()),
+                    crate::replication::WalOperation::DeleteCollection { name } => ("delete_collection", name.clone()),
+                    crate::replication::WalOperation::Compact { collection } => ("compact", collection.clone()),
+                };
+                WalEntryResp {
+                    seq: e.seq,
+                    timestamp: e.timestamp.to_rfc3339(),
+                    operation_type: op_type.to_string(),
+                    collection,
+                }
+            })
+            .collect();
+
+        Ok(Json(WalEntriesResp {
+            entries,
+            current_seq,
+            has_more,
+        }))
+    } else {
+        Ok(Json(WalEntriesResp {
+            entries: Vec::new(),
+            current_seq: 0,
+            has_more: false,
+        }))
+    }
+}
+
+// ============================================================================
+// Metrics Handler
+// ============================================================================
+
+/// Prometheus metrics endpoint.
+/// Returns metrics in Prometheus text exposition format.
+async fn prometheus_metrics(
+    State(state): State<Arc<CollectionAppState>>,
+) -> (StatusCode, [(axum::http::header::HeaderName, &'static str); 1], String) {
+    // Update collection metrics before gathering
+    for info in state.manager.list() {
+        metrics::update_collection_metrics(
+            &info.name,
+            info.vector_count + info.deleted_count,
+            info.deleted_count,
+            info.dim,
+        );
+    }
+
+    // Update total collections count
+    metrics::COLLECTIONS_TOTAL.set(state.manager.list().len() as f64);
+
+    // Update WAL metrics if replication is enabled
+    if let Some(ref replication) = state.replication {
+        if let Some(stats) = replication.wal_stats() {
+            metrics::update_wal_metrics(
+                stats.current_seq,
+                stats.total_entries,
+                stats.total_size_bytes,
+            );
+        }
+    }
+
+    // Gather and return metrics
+    let body = metrics::gather_metrics();
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
 }

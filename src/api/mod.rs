@@ -1,11 +1,17 @@
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
+use tokio_stream::StreamExt;
 use crate::proto::vectordb::vector_service_server::VectorService;
 use crate::proto::vectordb::*;
 use crate::collection::{CollectionManager, CollectionConfig};
-use crate::storage::{VectorStore, MetadataStore, MetadataEntry, IndexedMetadata};
+use crate::storage::{MetadataEntry, IndexedMetadata};
+use crate::replication::{ReplicationManager, ReplicationRole};
 use crate::payload::FilterQuery;
 use std::sync::Arc;
+use std::pin::Pin;
 use roaring::RoaringBitmap;
+use tokio::sync::mpsc;
+
+type StreamingResponse<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
 
 pub mod http;
 
@@ -34,11 +40,16 @@ pub fn create_range_bitmap(start: u64, end: u64) -> RoaringBitmap {
 #[derive(Clone)]
 pub struct VectorServiceImpl {
     pub manager: Arc<CollectionManager>,
+    pub replication: Option<Arc<ReplicationManager>>,
 }
 
 impl VectorServiceImpl {
     pub fn new(manager: Arc<CollectionManager>) -> Self {
-        Self { manager }
+        Self { manager, replication: None }
+    }
+
+    pub fn with_replication(manager: Arc<CollectionManager>, replication: Arc<ReplicationManager>) -> Self {
+        Self { manager, replication: Some(replication) }
     }
 
     fn get_collection(&self, name: &str) -> Result<Arc<crate::collection::Collection>, Status> {
@@ -545,5 +556,367 @@ impl VectorService for VectorServiceImpl {
             .map_err(|e| Status::not_found(format!("{}", e)))?;
 
         Ok(Response::new(DeleteSnapshotResponse { success: true }))
+    }
+
+    // ========================================================================
+    // Maintenance Operations
+    // ========================================================================
+
+    async fn compact(
+        &self,
+        request: Request<CompactRequest>,
+    ) -> Result<Response<CompactResponse>, Status> {
+        let req = request.into_inner();
+
+        let result = self.manager.compact(&req.collection)
+            .map_err(|e| Status::internal(format!("{}", e)))?;
+
+        Ok(Response::new(CompactResponse {
+            vectors_before: result.vectors_before as u64,
+            vectors_after: result.vectors_after as u64,
+            vectors_removed: result.vectors_removed as u64,
+            bytes_reclaimed: result.bytes_reclaimed,
+            success: true,
+        }))
+    }
+
+    // ========================================================================
+    // Replication Operations
+    // ========================================================================
+
+    async fn get_replication_status(
+        &self,
+        _request: Request<ReplicationStatusRequest>,
+    ) -> Result<Response<ReplicationStatusResponse>, Status> {
+        if let Some(ref replication) = self.replication {
+            let status = replication.status();
+
+            let role_str = match status.role {
+                ReplicationRole::Primary => "primary",
+                ReplicationRole::Replica => "replica",
+                ReplicationRole::Standalone => "standalone",
+            };
+
+            let (wal_entries, wal_size) = status.wal_stats
+                .map(|s| (s.total_entries as u64, s.total_size_bytes))
+                .unwrap_or((0, 0));
+
+            let (replica_status, primary_addr, last_seq) = status.replica_state
+                .map(|s| (format!("{:?}", s.status), s.primary_addr, s.last_seq))
+                .unwrap_or(("".to_string(), "".to_string(), 0));
+
+            Ok(Response::new(ReplicationStatusResponse {
+                role: role_str.to_string(),
+                current_seq: status.current_seq,
+                wal_entries,
+                wal_size_bytes: wal_size,
+                replica_status,
+                primary_addr,
+                last_synced_seq: last_seq,
+            }))
+        } else {
+            Ok(Response::new(ReplicationStatusResponse {
+                role: "standalone".to_string(),
+                current_seq: 0,
+                wal_entries: 0,
+                wal_size_bytes: 0,
+                replica_status: "".to_string(),
+                primary_addr: "".to_string(),
+                last_synced_seq: 0,
+            }))
+        }
+    }
+
+    async fn get_wal_entries(
+        &self,
+        request: Request<GetWalEntriesRequest>,
+    ) -> Result<Response<GetWalEntriesResponse>, Status> {
+        let req = request.into_inner();
+
+        if let Some(ref replication) = self.replication {
+            let entries = replication.get_entries_from(req.from_seq)
+                .map_err(|e| Status::internal(format!("{}", e)))?;
+
+            let current_seq = replication.current_seq();
+            let max_entries = if req.max_entries == 0 { usize::MAX } else { req.max_entries as usize };
+            let has_more = entries.len() > max_entries;
+
+            let entries: Vec<WalEntryProto> = entries
+                .into_iter()
+                .take(max_entries)
+                .map(|e| {
+                    let (op_type, collection) = match &e.operation {
+                        crate::replication::WalOperation::Insert { collection, .. } => ("insert", collection.clone()),
+                        crate::replication::WalOperation::InsertBatch { collection, .. } => ("insert_batch", collection.clone()),
+                        crate::replication::WalOperation::Delete { collection, .. } => ("delete", collection.clone()),
+                        crate::replication::WalOperation::DeleteBatch { collection, .. } => ("delete_batch", collection.clone()),
+                        crate::replication::WalOperation::Update { collection, .. } => ("update", collection.clone()),
+                        crate::replication::WalOperation::UpdateMetadata { collection, .. } => ("update_metadata", collection.clone()),
+                        crate::replication::WalOperation::CreateCollection { name, .. } => ("create_collection", name.clone()),
+                        crate::replication::WalOperation::DeleteCollection { name } => ("delete_collection", name.clone()),
+                        crate::replication::WalOperation::Compact { collection } => ("compact", collection.clone()),
+                    };
+
+                    let operation_data = serde_json::to_vec(&e.operation).unwrap_or_default();
+
+                    WalEntryProto {
+                        seq: e.seq,
+                        timestamp: e.timestamp.to_rfc3339(),
+                        operation_type: op_type.to_string(),
+                        collection,
+                        operation_data,
+                    }
+                })
+                .collect();
+
+            Ok(Response::new(GetWalEntriesResponse {
+                entries,
+                current_seq,
+                has_more,
+            }))
+        } else {
+            Ok(Response::new(GetWalEntriesResponse {
+                entries: Vec::new(),
+                current_seq: 0,
+                has_more: false,
+            }))
+        }
+    }
+
+    // ========================================================================
+    // Streaming Operations
+    // ========================================================================
+
+    /// Client streaming: receive chunks of vectors, return final response.
+    async fn stream_upsert(
+        &self,
+        request: Request<Streaming<StreamUpsertRequest>>,
+    ) -> Result<Response<StreamUpsertResponse>, Status> {
+        let mut stream = request.into_inner();
+        let mut collection_name = String::new();
+        let mut total_inserted: u64 = 0;
+        let mut start_id: u64 = 0;
+        let mut end_id: u64 = 0;
+        let mut first_chunk = true;
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result?;
+
+            // Get collection from first chunk
+            if first_chunk {
+                collection_name = chunk.collection.clone();
+                first_chunk = false;
+            }
+
+            if chunk.vectors.is_empty() {
+                continue;
+            }
+
+            let collection = self.get_collection(&collection_name)?;
+
+            // Extract vectors
+            let vectors: Vec<Vec<f32>> = chunk.vectors
+                .iter()
+                .filter_map(|bv| bv.vector.as_ref().map(|v| v.elements.clone()))
+                .collect();
+
+            if vectors.is_empty() {
+                continue;
+            }
+
+            // Batch insert to vector store
+            let chunk_start_id = collection.vector_store.insert_batch(&vectors)
+                .map_err(|e| Status::internal(format!("Storage error: {}", e)))?;
+
+            if total_inserted == 0 {
+                start_id = chunk_start_id;
+            }
+            end_id = chunk_start_id + vectors.len() as u64 - 1;
+
+            // Prepare index data
+            let index_data: Vec<(u64, Vec<f32>)> = vectors
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (chunk_start_id + i as u64, v))
+                .collect();
+
+            // Batch insert to HNSW index
+            collection.indexer.insert_batch(&index_data)
+                .map_err(|e| Status::internal(format!("Index error: {}", e)))?;
+
+            // Collect metadata entries
+            let metadata_entries: Vec<MetadataEntry> = chunk.vectors
+                .iter()
+                .enumerate()
+                .flat_map(|(i, bv)| {
+                    let id = chunk_start_id + i as u64;
+                    bv.metadata.iter().map(move |(k, v)| MetadataEntry {
+                        id,
+                        key: k.clone(),
+                        value: v.clone(),
+                    })
+                })
+                .collect();
+
+            if !metadata_entries.is_empty() {
+                collection.metadata_store.insert_batch(&metadata_entries)
+                    .map_err(|e| Status::internal(format!("Metadata error: {}", e)))?;
+            }
+
+            total_inserted += chunk.vectors.len() as u64;
+        }
+
+        Ok(Response::new(StreamUpsertResponse {
+            total_inserted,
+            start_id,
+            end_id,
+            success: true,
+            error: String::new(),
+        }))
+    }
+
+    /// Bidirectional streaming: receive vectors, send progress updates.
+    type StreamUpsertBidiStream = StreamingResponse<StreamUpsertProgress>;
+
+    async fn stream_upsert_bidi(
+        &self,
+        request: Request<Streaming<StreamUpsertRequest>>,
+    ) -> Result<Response<Self::StreamUpsertBidiStream>, Status> {
+        let mut stream = request.into_inner();
+        let manager = self.manager.clone();
+
+        let (tx, rx) = mpsc::channel(32);
+
+        // Spawn task to process incoming stream
+        tokio::spawn(async move {
+            let mut collection_name = String::new();
+            let mut total_inserted: u64 = 0;
+            let mut first_chunk = true;
+
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+
+                // Get collection from first chunk
+                if first_chunk {
+                    collection_name = chunk.collection.clone();
+                    first_chunk = false;
+                }
+
+                if chunk.vectors.is_empty() {
+                    continue;
+                }
+
+                // Get collection
+                let collection = if collection_name.is_empty() {
+                    match manager.get_or_create_default(DEFAULT_DIM) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(Err(Status::internal(format!("{}", e)))).await;
+                            return;
+                        }
+                    }
+                } else {
+                    match manager.get(&collection_name) {
+                        Some(c) => c,
+                        None => {
+                            let _ = tx.send(Err(Status::not_found("Collection not found"))).await;
+                            return;
+                        }
+                    }
+                };
+
+                // Extract vectors
+                let vectors: Vec<Vec<f32>> = chunk.vectors
+                    .iter()
+                    .filter_map(|bv| bv.vector.as_ref().map(|v| v.elements.clone()))
+                    .collect();
+
+                if vectors.is_empty() {
+                    continue;
+                }
+
+                let chunk_count = vectors.len() as u32;
+
+                // Batch insert to vector store
+                let chunk_start_id = match collection.vector_store.insert_batch(&vectors) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = tx.send(Err(Status::internal(format!("{}", e)))).await;
+                        return;
+                    }
+                };
+
+                // Prepare index data
+                let index_data: Vec<(u64, Vec<f32>)> = vectors
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| (chunk_start_id + i as u64, v))
+                    .collect();
+
+                // Batch insert to HNSW index
+                if let Err(e) = collection.indexer.insert_batch(&index_data) {
+                    let _ = tx.send(Err(Status::internal(format!("{}", e)))).await;
+                    return;
+                }
+
+                // Collect metadata entries
+                let metadata_entries: Vec<MetadataEntry> = chunk.vectors
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, bv)| {
+                        let id = chunk_start_id + i as u64;
+                        bv.metadata.iter().map(move |(k, v)| MetadataEntry {
+                            id,
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                    })
+                    .collect();
+
+                if !metadata_entries.is_empty() {
+                    if let Err(e) = collection.metadata_store.insert_batch(&metadata_entries) {
+                        let _ = tx.send(Err(Status::internal(format!("{}", e)))).await;
+                        return;
+                    }
+                }
+
+                total_inserted += chunk_count as u64;
+
+                // Send progress update
+                let progress = StreamUpsertProgress {
+                    inserted_so_far: total_inserted,
+                    current_chunk_start_id: chunk_start_id,
+                    current_chunk_count: chunk_count,
+                    progress_percent: 0.0, // Calculated by client if total known
+                    is_complete: chunk.is_last,
+                };
+
+                if tx.send(Ok(progress)).await.is_err() {
+                    return; // Client disconnected
+                }
+
+                if chunk.is_last {
+                    break;
+                }
+            }
+
+            // Send final completion message
+            let _ = tx.send(Ok(StreamUpsertProgress {
+                inserted_so_far: total_inserted,
+                current_chunk_start_id: 0,
+                current_chunk_count: 0,
+                progress_percent: 100.0,
+                is_complete: true,
+            })).await;
+        });
+
+        let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(output_stream) as Self::StreamUpsertBidiStream))
     }
 }

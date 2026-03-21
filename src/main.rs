@@ -12,6 +12,10 @@ async fn main() -> Result<()> {
     // Basic tracing setup
     tracing_subscriber::fmt::init();
 
+    // Initialize metrics
+    vectordb::metrics::init_metrics();
+    println!("Metrics initialized");
+
     // Load configuration
     let config = AppConfig::load()?;
     println!("Configuration loaded: {:?}", config);

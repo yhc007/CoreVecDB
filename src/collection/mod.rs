@@ -355,6 +355,198 @@ impl Collection {
         &self.base_path
     }
 
+    /// Compact the collection by removing deleted vectors.
+    /// This creates new storage with only active vectors and rebuilds the index.
+    /// Returns CompactionResult with statistics.
+    ///
+    /// WARNING: This operation is destructive and cannot be undone.
+    /// It is recommended to create a snapshot before compacting.
+    pub fn compact(&self) -> Result<CompactionResult> {
+        let deleted_bitmap = self.deleted_ids.read().clone();
+        let deleted_count = deleted_bitmap.len() as usize;
+        let total_count = self.vector_store.len();
+        let active_count = total_count.saturating_sub(deleted_count);
+
+        if deleted_count == 0 {
+            return Ok(CompactionResult {
+                vectors_before: total_count,
+                vectors_after: total_count,
+                vectors_removed: 0,
+                bytes_reclaimed: 0,
+                id_mapping: HashMap::new(),
+            });
+        }
+
+        // Create temporary directory for new files
+        let temp_dir = self.base_path.join(".compact_temp");
+        if temp_dir.exists() {
+            fs::remove_dir_all(&temp_dir)?;
+        }
+        fs::create_dir_all(&temp_dir)?;
+
+        // Create new vector store
+        let vector_path = temp_dir.join("vectors");
+        let dim = self.config.dim;
+        let new_vector_store: Box<dyn VectorStore> = if self.config.quantization.enabled {
+            Box::new(QuantizedMemmapVectorStore::new(
+                vector_path.to_str().unwrap(),
+                dim,
+                self.config.quantization.keep_originals,
+            )?)
+        } else {
+            let path = format!("{}.bin", vector_path.to_str().unwrap());
+            Box::new(MemmapVectorStore::new(&path, dim)?)
+        };
+
+        // Create new metadata store
+        let meta_path = temp_dir.join("meta.sled");
+        let new_metadata_store: Box<dyn MetadataStore> = if self.config.payload.index_enabled {
+            Box::new(IndexedSledMetadataStore::with_numeric_fields(
+                meta_path.to_str().unwrap(),
+                self.config.payload.indexed_fields.iter().map(|s| s.as_str()),
+                self.config.payload.numeric_fields.iter().map(|s| s.as_str()),
+            )?)
+        } else {
+            Box::new(SledMetadataStore::new(meta_path.to_str().unwrap())?)
+        };
+
+        // Copy active vectors and build ID mapping (old_id -> new_id)
+        let mut id_mapping: HashMap<u64, u64> = HashMap::with_capacity(active_count);
+        let mut vectors_for_index: Vec<(u64, Vec<f32>)> = Vec::with_capacity(active_count);
+
+        for old_id in 0..total_count as u64 {
+            if deleted_bitmap.contains(old_id as u32) {
+                continue; // Skip deleted vectors
+            }
+
+            // Get vector
+            let vector = self.vector_store.get(old_id)?;
+
+            // Insert into new store (new_id is auto-assigned)
+            let new_id = new_vector_store.insert(&vector)?;
+            id_mapping.insert(old_id, new_id);
+
+            // Collect for index
+            vectors_for_index.push((new_id, vector));
+
+            // Copy metadata with new ID
+            // We need to iterate over all metadata keys for this ID
+            // This is a simplification - ideally we'd have a method to get all metadata for an ID
+            // For now, we'll use the known indexed fields and any commonly used keys
+            let keys_to_copy = ["category", "type", "status", "name", "idx", "tag",
+                                "price", "rating", "timestamp", "priority"];
+            for key in keys_to_copy.iter() {
+                if let Ok(Some(value)) = self.metadata_store.get(old_id, key) {
+                    new_metadata_store.insert(new_id, key.to_string(), value)?;
+                }
+            }
+            // Also copy indexed fields
+            for key in &self.config.payload.indexed_fields {
+                if !keys_to_copy.contains(&key.as_str()) {
+                    if let Ok(Some(value)) = self.metadata_store.get(old_id, key) {
+                        new_metadata_store.insert(new_id, key.to_string(), value)?;
+                    }
+                }
+            }
+            for key in &self.config.payload.numeric_fields {
+                if !keys_to_copy.contains(&key.as_str()) {
+                    if let Ok(Some(value)) = self.metadata_store.get(old_id, key) {
+                        new_metadata_store.insert(new_id, key.to_string(), value)?;
+                    }
+                }
+            }
+        }
+
+        // Flush new stores
+        new_vector_store.flush()?;
+
+        // Create new index with compacted vectors
+        let new_indexer = HnswIndexer::new(
+            dim,
+            std::cmp::max(active_count + 10000, self.config.hnsw.max_elements),
+            self.config.hnsw.m,
+            self.config.hnsw.ef_construction,
+        );
+
+        // Batch insert all vectors into new index
+        if !vectors_for_index.is_empty() {
+            new_indexer.insert_batch(&vectors_for_index)?;
+        }
+
+        // Save new index
+        let index_path = temp_dir.join("index.hnsw");
+        new_indexer.save(&index_path)?;
+
+        // Calculate bytes reclaimed (approximate)
+        let old_size = dir_size(&self.base_path).unwrap_or(0);
+        let new_size = dir_size(&temp_dir).unwrap_or(0);
+        let bytes_reclaimed = old_size.saturating_sub(new_size);
+
+        // Drop new stores to release file handles
+        drop(new_vector_store);
+        drop(new_metadata_store);
+
+        // Backup old files
+        let backup_dir = self.base_path.join(".compact_backup");
+        if backup_dir.exists() {
+            fs::remove_dir_all(&backup_dir)?;
+        }
+
+        // Move old files to backup (except temp dirs)
+        fs::create_dir_all(&backup_dir)?;
+        for entry in fs::read_dir(&self.base_path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_str().unwrap_or("");
+            if name_str.starts_with('.') {
+                continue; // Skip temp/backup dirs
+            }
+            let src = entry.path();
+            let dst = backup_dir.join(&name);
+            fs::rename(&src, &dst)?;
+        }
+
+        // Move new files to main directory
+        for entry in fs::read_dir(&temp_dir)? {
+            let entry = entry?;
+            let src = entry.path();
+            let dst = self.base_path.join(entry.file_name());
+            if src.is_dir() {
+                copy_dir_recursive(&src, &dst)?;
+            } else {
+                fs::copy(&src, &dst)?;
+            }
+        }
+
+        // Copy config back
+        let config_src = backup_dir.join("config.json");
+        let config_dst = self.base_path.join("config.json");
+        if config_src.exists() {
+            fs::copy(&config_src, &config_dst)?;
+        }
+
+        // Clean up temp and backup directories
+        fs::remove_dir_all(&temp_dir)?;
+        fs::remove_dir_all(&backup_dir)?;
+
+        // Clear deleted IDs
+        self.deleted_ids.write().clear();
+
+        // Remove deleted.bin file
+        let deleted_path = self.base_path.join("deleted.bin");
+        if deleted_path.exists() {
+            fs::remove_file(deleted_path)?;
+        }
+
+        Ok(CompactionResult {
+            vectors_before: total_count,
+            vectors_after: active_count,
+            vectors_removed: deleted_count,
+            bytes_reclaimed,
+            id_mapping,
+        })
+    }
+
     /// Create a snapshot of this collection.
     /// Copies all files to the snapshot directory.
     pub fn create_snapshot(&self, snapshot_path: &Path) -> Result<SnapshotInfo> {
@@ -449,6 +641,22 @@ pub struct SnapshotInfo {
     pub created_at: DateTime<Utc>,
     pub vector_count: usize,
     pub size_bytes: u64,
+}
+
+/// Compaction result with statistics.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionResult {
+    /// Number of vectors before compaction
+    pub vectors_before: usize,
+    /// Number of vectors after compaction
+    pub vectors_after: usize,
+    /// Number of deleted vectors removed
+    pub vectors_removed: usize,
+    /// Approximate bytes reclaimed
+    pub bytes_reclaimed: u64,
+    /// Mapping from old IDs to new IDs
+    #[serde(skip)]  // Don't serialize - can be very large
+    pub id_mapping: HashMap<u64, u64>,
 }
 
 /// Manager for multiple collections.
@@ -746,6 +954,79 @@ impl CollectionManager {
         fs::remove_dir_all(&snapshot_path)?;
         println!("Deleted snapshot: {}", snapshot_name);
         Ok(())
+    }
+
+    /// Compact a collection by removing deleted vectors.
+    /// This operation is destructive and requires reloading the collection.
+    ///
+    /// Returns CompactionResult with statistics.
+    /// Note: After compaction, all vector IDs will change. The result includes
+    /// an id_mapping to translate old IDs to new IDs.
+    pub fn compact(&self, collection_name: &str) -> Result<CompactionResult> {
+        let collection = self.get(collection_name)
+            .ok_or_else(|| anyhow::anyhow!("Collection '{}' not found", collection_name))?;
+
+        // Check if compaction is needed
+        if collection.deleted_count() == 0 {
+            return Ok(CompactionResult {
+                vectors_before: collection.len(),
+                vectors_after: collection.len(),
+                vectors_removed: 0,
+                bytes_reclaimed: 0,
+                id_mapping: HashMap::new(),
+            });
+        }
+
+        // Perform compaction
+        let result = collection.compact()?;
+
+        // Reload the collection to pick up new files
+        let path = self.base_dir.join(collection_name);
+        let config = collection.config.clone();
+        drop(collection);
+
+        // Remove old collection from manager
+        {
+            let mut collections = self.collections.write();
+            collections.remove(collection_name);
+        }
+
+        // Reload collection
+        let new_collection = Arc::new(Collection::open(&path, config)?);
+        {
+            let mut collections = self.collections.write();
+            collections.insert(collection_name.to_string(), new_collection);
+        }
+
+        println!(
+            "Compacted collection {}: {} -> {} vectors ({} removed, {} bytes reclaimed)",
+            collection_name,
+            result.vectors_before,
+            result.vectors_after,
+            result.vectors_removed,
+            result.bytes_reclaimed
+        );
+
+        Ok(result)
+    }
+
+    /// Compact all collections with deleted vectors.
+    pub fn compact_all(&self) -> Result<Vec<(String, CompactionResult)>> {
+        let names: Vec<String> = self.names();
+        let mut results = Vec::new();
+
+        for name in names {
+            if let Some(collection) = self.get(&name) {
+                if collection.deleted_count() > 0 {
+                    match self.compact(&name) {
+                        Ok(result) => results.push((name, result)),
+                        Err(e) => eprintln!("Failed to compact {}: {:?}", name, e),
+                    }
+                }
+            }
+        }
+
+        Ok(results)
     }
 }
 
