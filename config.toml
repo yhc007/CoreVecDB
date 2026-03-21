@@ -1,10 +1,10 @@
 [server]
-grpc_port = 50051
-http_port = 3000
+grpc_port = 50061
+http_port = 3100
 data_dir = "data"
 
 [index]
-dim = 128
+dim = 1024
 max_elements = 10000
 m = 24
 ef_construction = 400

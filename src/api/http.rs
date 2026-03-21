@@ -128,6 +128,9 @@ pub struct JsonSearchReq {
     filter_ids: Option<Vec<u64>>,
     /// Range filter: [start, end] inclusive. More efficient than listing all IDs.
     filter_id_range: Option<(u64, u64)>,
+    /// Include metadata in search results (default: false).
+    #[serde(default)]
+    include_metadata: bool,
 }
 
 #[derive(Serialize)]
@@ -139,6 +142,9 @@ pub struct JsonSearchResp {
 pub struct JsonSearchResult {
     id: u64,
     score: f32,
+    /// Metadata (only present when include_metadata=true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 // ============================================================================
@@ -446,6 +452,8 @@ async fn collection_search(
     let results = collection.indexer.search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let include_meta = payload.include_metadata;
+
     let final_results: Vec<JsonSearchResult> = if has_metadata_filter && !used_index_filter {
         results
             .into_iter()
@@ -460,12 +468,26 @@ async fn collection_search(
                         .unwrap_or(false)
                 })
             })
-            .map(|(id, score)| JsonSearchResult { id, score })
+            .map(|(id, score)| {
+                let metadata = if include_meta {
+                    Some(collection.metadata_store.get_all(id))
+                } else {
+                    None
+                };
+                JsonSearchResult { id, score, metadata }
+            })
             .collect()
     } else {
         results
             .into_iter()
-            .map(|(id, score)| JsonSearchResult { id, score })
+            .map(|(id, score)| {
+                let metadata = if include_meta {
+                    Some(collection.metadata_store.get_all(id))
+                } else {
+                    None
+                };
+                JsonSearchResult { id, score, metadata }
+            })
             .collect()
     };
 
@@ -868,6 +890,8 @@ async fn legacy_search(
     let results = collection.indexer.search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let include_meta = payload.include_metadata;
+
     let final_results: Vec<JsonSearchResult> = if has_metadata_filter && !used_index_filter {
         results
             .into_iter()
@@ -882,12 +906,26 @@ async fn legacy_search(
                         .unwrap_or(false)
                 })
             })
-            .map(|(id, score)| JsonSearchResult { id, score })
+            .map(|(id, score)| {
+                let metadata = if include_meta {
+                    Some(collection.metadata_store.get_all(id))
+                } else {
+                    None
+                };
+                JsonSearchResult { id, score, metadata }
+            })
             .collect()
     } else {
         results
             .into_iter()
-            .map(|(id, score)| JsonSearchResult { id, score })
+            .map(|(id, score)| {
+                let metadata = if include_meta {
+                    Some(collection.metadata_store.get_all(id))
+                } else {
+                    None
+                };
+                JsonSearchResult { id, score, metadata }
+            })
             .collect()
     };
 

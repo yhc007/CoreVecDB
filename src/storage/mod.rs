@@ -50,6 +50,9 @@ pub trait MetadataStore: Send + Sync {
     fn insert(&self, id: u64, key: String, value: String) -> Result<()>;
     fn get(&self, id: u64, key: &str) -> Result<Option<String>>;
 
+    /// Get all metadata for a given ID.
+    fn get_all(&self, id: u64) -> std::collections::HashMap<String, String>;
+
     /// Try to filter by key-value conditions using payload index.
     /// Returns None if indexing is not available (will fallback to post-filter).
     /// Returns Some(bitmap) with matching IDs if index is available.
@@ -462,6 +465,28 @@ impl MetadataStore for SledMetadataStore {
         Ok(())
     }
 
+    fn get_all(&self, id: u64) -> std::collections::HashMap<String, String> {
+        let prefix = format!("{}:", id);
+        let mut result = std::collections::HashMap::new();
+
+        // Scan all keys with the given ID prefix
+        for item in self.db.scan_prefix(prefix.as_bytes()) {
+            if let Ok((key, value)) = item {
+                if let (Ok(k), Ok(v)) = (
+                    String::from_utf8(key.to_vec()),
+                    String::from_utf8(value.to_vec()),
+                ) {
+                    // Extract key name (remove "id:" prefix)
+                    if let Some(key_name) = k.strip_prefix(&prefix) {
+                        result.insert(key_name.to_string(), v);
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
@@ -699,6 +724,10 @@ impl MetadataStore for IndexedSledMetadataStore {
 
         // Delegate to inner store for atomic batch write
         self.inner.insert_batch(entries)
+    }
+
+    fn get_all(&self, id: u64) -> std::collections::HashMap<String, String> {
+        self.inner.get_all(id)
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
