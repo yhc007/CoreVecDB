@@ -35,6 +35,7 @@ tracing-subscriber = "0.3"
 
 # Utilities
 anyhow = "1.0"
+crc32fast = "1.4"
 thiserror = "1.0"
 parking_lot = "0.12"
 rayon = "1.8"
@@ -43,11 +44,16 @@ lru = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 async-stream = "0.3"
 futures = "0.3"
+rand = "0.8"
 
 # Metrics
 prometheus = "0.13"
 lazy_static = "1.4"
+once_cell = "1.19"
 
 [build-dependencies]
 tonic-build = "0.11"
 protoc-bin-vendored = "3.0"
+
+[dev-dependencies]
+tempfile = "3.10"

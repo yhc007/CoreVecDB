@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::convert::Infallible;
 use futures::stream::Stream;
 use crate::api::{create_filter_bitmap, create_range_bitmap};
-use crate::collection::{CollectionManager, CollectionConfig, CollectionInfo, SnapshotInfo};
-use crate::storage::{VectorStore, MetadataEntry, IndexedMetadata};
+use crate::collection::{CollectionManager, CollectionConfig, CollectionInfo, SnapshotInfo, WalConfigWrapper};
+use crate::storage::{MetadataEntry, IndexedMetadata};
 use crate::payload::FilterQuery;
 use crate::replication::{ReplicationManager, ReplicationRole};
 use crate::metrics;
@@ -152,6 +152,50 @@ pub struct JsonSearchResult {
     metadata: Option<std::collections::HashMap<String, String>>,
 }
 
+/// Streaming search request for large result sets.
+#[derive(Deserialize)]
+pub struct StreamSearchReq {
+    vector: Vec<f32>,
+    k: u32,
+    #[serde(default)]
+    filter: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    range_filters: Vec<RangeFilter>,
+    #[serde(default)]
+    filter_ids: Option<Vec<u64>>,
+    /// Results per batch (default: 100)
+    #[serde(default)]
+    batch_size: Option<u32>,
+    /// Include vectors in results
+    #[serde(default)]
+    include_vectors: bool,
+    /// Include metadata in results
+    #[serde(default)]
+    include_metadata: bool,
+}
+
+/// Streaming search result batch.
+#[derive(Serialize)]
+pub struct StreamSearchResultBatch {
+    results: Vec<StreamSearchResultItem>,
+    batch_index: u32,
+    total_batches: u32,
+    results_so_far: u32,
+    total_results: u32,
+    is_last: bool,
+}
+
+/// Single result in streaming search.
+#[derive(Serialize)]
+pub struct StreamSearchResultItem {
+    id: u64,
+    score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<std::collections::HashMap<String, String>>,
+}
+
 // ============================================================================
 // Multi-Collection API
 // ============================================================================
@@ -175,6 +219,321 @@ pub struct CreateCollectionReq {
     indexed_fields: Option<Vec<String>>,
     #[serde(default)]
     numeric_fields: Option<Vec<String>>,
+    /// Text fields for BM25 full-text search
+    #[serde(default)]
+    text_fields: Option<Vec<String>>,
+    /// Enable WAL for crash recovery (default: true)
+    #[serde(default)]
+    wal_enabled: Option<bool>,
+    /// Sync WAL to disk on each write (safer but slower)
+    #[serde(default)]
+    wal_sync_on_write: Option<bool>,
+}
+
+/// Hybrid search request (vector + text).
+#[derive(Deserialize)]
+pub struct HybridSearchReq {
+    vector: Vec<f32>,
+    query: String,
+    k: u32,
+    /// Weight for vector score (0.0-1.0, default: 0.5)
+    #[serde(default)]
+    alpha: Option<f32>,
+    /// Fusion method: "weighted" or "rrf" (default: "weighted")
+    #[serde(default)]
+    fusion_method: Option<String>,
+    #[serde(default)]
+    filter: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    range_filters: Vec<RangeFilter>,
+    #[serde(default)]
+    include_scores: bool,
+    #[serde(default)]
+    include_metadata: bool,
+}
+
+/// Hybrid search result.
+#[derive(Serialize)]
+pub struct HybridSearchResult {
+    id: u64,
+    combined_score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Hybrid search response.
+#[derive(Serialize)]
+pub struct HybridSearchResp {
+    results: Vec<HybridSearchResult>,
+    total_candidates: u32,
+}
+
+/// Text-only search request using BM25.
+#[derive(Deserialize)]
+pub struct TextSearchReq {
+    query: String,
+    k: u32,
+    #[serde(default)]
+    filter: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    must_match_all: bool,
+    #[serde(default)]
+    include_metadata: bool,
+}
+
+/// Text search result.
+#[derive(Serialize)]
+pub struct TextSearchResultItem {
+    id: u64,
+    score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Text search response.
+#[derive(Serialize)]
+pub struct TextSearchResp {
+    results: Vec<TextSearchResultItem>,
+}
+
+// =============================================================================
+// Multi-Vector Search Types
+// =============================================================================
+
+/// Multi-vector search request.
+#[derive(Deserialize)]
+pub struct MultiVectorSearchReq {
+    /// Multiple query vectors
+    vectors: Vec<Vec<f32>>,
+    /// Number of results to return
+    k: u32,
+    /// Fusion method: "sum", "max", "avg", "rrf", "min"
+    #[serde(default = "default_fusion")]
+    fusion: String,
+    /// Optional weights for each vector (for weighted fusion)
+    #[serde(default)]
+    weights: Option<Vec<f32>>,
+    /// RRF k parameter (default 60)
+    #[serde(default = "default_rrf_k")]
+    rrf_k: f32,
+    /// Oversample factor (fetch more candidates per query)
+    #[serde(default = "default_oversample")]
+    oversample: u32,
+    /// Optional metadata filter
+    #[serde(default)]
+    filter: std::collections::HashMap<String, String>,
+    /// Include per-query scores in response
+    #[serde(default)]
+    include_per_query_scores: bool,
+    /// Include metadata in results
+    #[serde(default)]
+    include_metadata: bool,
+}
+
+fn default_fusion() -> String { "rrf".to_string() }
+fn default_rrf_k() -> f32 { 60.0 }
+fn default_oversample() -> u32 { 2 }
+
+/// Multi-vector search result.
+#[derive(Serialize)]
+pub struct MultiVectorSearchResult {
+    id: u64,
+    score: f32,
+    query_matches: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_query_scores: Option<Vec<Option<f32>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Multi-vector search response.
+#[derive(Serialize)]
+pub struct MultiVectorSearchResp {
+    results: Vec<MultiVectorSearchResult>,
+    num_queries: usize,
+    fusion_method: String,
+}
+
+// =============================================================================
+// Sparse Vector Types
+// =============================================================================
+
+/// Sparse vector upsert request.
+#[derive(Deserialize)]
+pub struct SparseUpsertReq {
+    /// Dimension indices (non-zero positions)
+    indices: Vec<u32>,
+    /// Values at each index
+    values: Vec<f32>,
+    /// Optional metadata
+    #[serde(default)]
+    metadata: std::collections::HashMap<String, String>,
+}
+
+/// Batch sparse vector upsert request.
+#[derive(Deserialize)]
+pub struct SparseBatchUpsertReq {
+    vectors: Vec<SparseUpsertReq>,
+}
+
+/// Sparse search request.
+#[derive(Deserialize)]
+pub struct SparseSearchReq {
+    /// Query vector indices
+    indices: Vec<u32>,
+    /// Query vector values
+    values: Vec<f32>,
+    /// Number of results
+    k: u32,
+    /// Optional metadata filter
+    #[serde(default)]
+    filter: std::collections::HashMap<String, String>,
+    /// Include metadata in results
+    #[serde(default)]
+    include_metadata: bool,
+}
+
+/// Sparse search result.
+#[derive(Serialize)]
+pub struct SparseSearchResult {
+    id: u64,
+    score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Sparse search response.
+#[derive(Serialize)]
+pub struct SparseSearchResp {
+    results: Vec<SparseSearchResult>,
+}
+
+/// Hybrid dense + sparse search request.
+#[derive(Deserialize)]
+pub struct HybridDenseSparseReq {
+    /// Dense query vector
+    dense_vector: Vec<f32>,
+    /// Sparse query indices
+    sparse_indices: Vec<u32>,
+    /// Sparse query values
+    sparse_values: Vec<f32>,
+    /// Number of results
+    k: u32,
+    /// Weight for dense score (0.0 to 1.0)
+    #[serde(default = "default_dense_weight")]
+    dense_weight: f32,
+    /// Weight for sparse score (0.0 to 1.0)
+    #[serde(default = "default_sparse_weight")]
+    sparse_weight: f32,
+    /// Fusion method: "weighted", "rrf", "max"
+    #[serde(default = "default_hybrid_fusion")]
+    fusion: String,
+    /// Optional metadata filter
+    #[serde(default)]
+    filter: std::collections::HashMap<String, String>,
+    /// Include component scores in results
+    #[serde(default)]
+    include_scores: bool,
+    /// Include metadata in results
+    #[serde(default)]
+    include_metadata: bool,
+}
+
+fn default_dense_weight() -> f32 { 0.5 }
+fn default_sparse_weight() -> f32 { 0.5 }
+fn default_hybrid_fusion() -> String { "weighted".to_string() }
+
+/// Hybrid search result.
+#[derive(Serialize)]
+pub struct HybridDenseSparseResult {
+    id: u64,
+    score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dense_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sparse_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Hybrid search response.
+#[derive(Serialize)]
+pub struct HybridDenseSparseResp {
+    results: Vec<HybridDenseSparseResult>,
+    fusion_method: String,
+}
+
+// =============================================================================
+// Versioning Types
+// =============================================================================
+
+/// Versioned upsert request.
+#[derive(Deserialize)]
+pub struct VersionedUpsertReq {
+    /// Vector ID to upsert
+    vector_id: u64,
+    /// Vector data
+    vector: Vec<f32>,
+    /// Metadata
+    #[serde(default)]
+    metadata: std::collections::HashMap<String, String>,
+    /// Optional change description
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Get version at timestamp request.
+#[derive(Deserialize)]
+pub struct GetAtTimestampReq {
+    /// ISO 8601 timestamp
+    timestamp: String,
+}
+
+/// Rollback request.
+#[derive(Deserialize)]
+pub struct RollbackReq {
+    /// Version ID to rollback to
+    to_version_id: u64,
+}
+
+/// Snapshot at timestamp request.
+#[derive(Deserialize)]
+pub struct SnapshotAtReq {
+    /// ISO 8601 timestamp
+    timestamp: String,
+}
+
+/// Version info response.
+#[derive(Serialize)]
+pub struct VersionInfoResp {
+    version_id: u64,
+    vector_id: u64,
+    timestamp: String,
+    is_deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+impl From<crate::versioning::VectorVersion> for VersionInfoResp {
+    fn from(v: crate::versioning::VectorVersion) -> Self {
+        Self {
+            version_id: v.version_id,
+            vector_id: v.vector_id,
+            timestamp: v.timestamp.to_rfc3339(),
+            is_deleted: v.is_deleted,
+            change_description: v.change_description,
+            vector: if v.is_deleted { None } else { Some(v.vector) },
+            metadata: if v.metadata.is_empty() { None } else { Some(v.metadata) },
+        }
+    }
 }
 
 /// Create router with multi-collection support.
@@ -206,6 +565,27 @@ pub async fn collection_router_with_replication(
         .route("/collections/:name/delete_batch", post(collection_delete_batch))
         // Streaming upsert with progress (SSE)
         .route("/collections/:name/stream_upsert", post(collection_stream_upsert))
+        // Streaming search with SSE (for large k values)
+        .route("/collections/:name/stream_search", post(collection_stream_search))
+        // Hybrid search (vector + text BM25)
+        .route("/collections/:name/hybrid_search", post(collection_hybrid_search))
+        // Text-only search (BM25)
+        .route("/collections/:name/text_search", post(collection_text_search))
+        // Multi-vector search
+        .route("/collections/:name/multi_search", post(collection_multi_search))
+        // Sparse vector operations
+        .route("/collections/:name/sparse_upsert", post(collection_sparse_upsert))
+        .route("/collections/:name/sparse_upsert_batch", post(collection_sparse_upsert_batch))
+        .route("/collections/:name/sparse_search", post(collection_sparse_search))
+        .route("/collections/:name/hybrid_dense_sparse", post(collection_hybrid_dense_sparse))
+        // Versioning operations
+        .route("/collections/:name/versioned/upsert", post(versioned_upsert))
+        .route("/collections/:name/versioned/vectors/:id", get(versioned_get))
+        .route("/collections/:name/versioned/vectors/:id/history", get(versioned_history))
+        .route("/collections/:name/versioned/vectors/:id/at", post(versioned_at_timestamp))
+        .route("/collections/:name/versioned/vectors/:id/rollback", post(versioned_rollback))
+        .route("/collections/:name/versioned/snapshot", post(versioned_snapshot))
+        .route("/collections/:name/versioned/stats", get(versioned_stats))
         // Snapshot operations
         .route("/collections/:name/snapshots", get(list_snapshots))
         .route("/collections/:name/snapshots", post(create_snapshot))
@@ -213,11 +593,24 @@ pub async fn collection_router_with_replication(
         .route("/snapshots/:snapshot_name/restore", post(restore_snapshot))
         // Maintenance operations
         .route("/collections/:name/compact", post(collection_compact))
+        .route("/collections/:name/checkpoint", post(collection_checkpoint))
+        .route("/collections/:name/wal_stats", get(collection_wal_stats))
+        .route("/checkpoint_all", post(checkpoint_all))
         // Replication status
         .route("/replication/status", get(replication_status))
         .route("/replication/wal", get(get_wal_entries))
         // Metrics
         .route("/metrics", get(prometheus_metrics))
+        // SIMD info
+        .route("/simd", get(simd_info))
+        // Sharding management
+        .route("/sharding/config", get(get_sharding_config))
+        .route("/sharding/config", post(update_sharding_config))
+        .route("/sharding/shards", get(list_shards))
+        .route("/sharding/shards/:shard_id", get(get_shard_info))
+        .route("/sharding/shards", post(add_shard))
+        .route("/sharding/shards/:shard_id", delete(remove_shard))
+        .route("/sharding/route/:vector_id", get(get_shard_for_id))
         // Legacy routes (use default collection)
         .route("/upsert", post(legacy_upsert))
         .route("/upsert_batch", post(legacy_upsert_batch))
@@ -258,10 +651,18 @@ async fn create_collection(
         config = config.with_quantization(enabled, true);
     }
 
-    if req.indexed_fields.is_some() || req.numeric_fields.is_some() {
+    if req.indexed_fields.is_some() || req.numeric_fields.is_some() || req.text_fields.is_some() {
         config.payload.indexed_fields = req.indexed_fields.unwrap_or_default();
         config.payload.numeric_fields = req.numeric_fields.unwrap_or_default();
+        config.payload.text_fields = req.text_fields.unwrap_or_default();
     }
+
+    // Configure WAL settings
+    config.wal = WalConfigWrapper {
+        enabled: req.wal_enabled.unwrap_or(true),
+        sync_on_write: req.wal_sync_on_write.unwrap_or(false),
+        checkpoint_interval: 10000, // default
+    };
 
     state.manager.create(config)
         .map(|c| Json(c.info()))
@@ -740,6 +1141,820 @@ async fn collection_stream_upsert(
     Ok(Sse::new(stream))
 }
 
+/// Streaming search with SSE for large result sets.
+/// Returns results in batches, useful when k is large (e.g., k > 1000).
+async fn collection_stream_search(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<StreamSearchReq>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let k = payload.k as usize;
+    let batch_size = payload.batch_size.unwrap_or(100) as usize;
+    let include_vectors = payload.include_vectors;
+    let include_metadata = payload.include_metadata;
+
+    // Build filter bitmap (same as regular search)
+    let mut filter_bitmap: Option<roaring::RoaringBitmap> = None;
+
+    // String field filters
+    if !payload.filter.is_empty() {
+        let conditions: Vec<(&str, &str)> = payload.filter
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        if let Some(indexed_bitmap) = collection.metadata_store.try_filter_and(&conditions) {
+            filter_bitmap = Some(indexed_bitmap);
+        }
+    }
+
+    // Range filters
+    if !payload.range_filters.is_empty() {
+        if let Some(indexed_store) = collection.metadata_store
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::storage::IndexedSledMetadataStore>())
+        {
+            if let Some(range_bitmap) = apply_range_filters(indexed_store, &payload.range_filters) {
+                filter_bitmap = Some(
+                    filter_bitmap
+                        .map(|existing| existing & &range_bitmap)
+                        .unwrap_or(range_bitmap)
+                );
+            }
+        }
+    }
+
+    // Explicit ID filter
+    if let Some(ref ids) = payload.filter_ids {
+        if !ids.is_empty() {
+            let id_bitmap = crate::api::create_filter_bitmap(ids);
+            filter_bitmap = Some(
+                filter_bitmap
+                    .map(|existing| existing & &id_bitmap)
+                    .unwrap_or(id_bitmap)
+            );
+        }
+    }
+
+    // Exclude deleted vectors
+    let deleted_bitmap = collection.deleted_bitmap();
+    if !deleted_bitmap.is_empty() {
+        let total = collection.len() as u64;
+        let mut universe = roaring::RoaringBitmap::new();
+        universe.insert_range(0..total as u32);
+        let active_bitmap = &universe - &deleted_bitmap;
+        filter_bitmap = Some(
+            filter_bitmap
+                .map(|existing| existing & &active_bitmap)
+                .unwrap_or(active_bitmap)
+        );
+    }
+
+    // Perform search
+    let results = collection.indexer.search(&payload.vector, k, filter_bitmap.as_ref())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let total_results = results.len();
+    let total_batches = (total_results + batch_size - 1) / batch_size;
+
+    // Clone for the async stream
+    let vector_store = collection.vector_store.clone();
+    let metadata_store = collection.metadata_store.clone();
+
+    let stream = async_stream::stream! {
+        let mut results_sent: u32 = 0;
+
+        if total_results == 0 {
+            let batch = StreamSearchResultBatch {
+                results: Vec::new(),
+                batch_index: 0,
+                total_batches: 0,
+                results_so_far: 0,
+                total_results: 0,
+                is_last: true,
+            };
+
+            let event = Event::default()
+                .event("batch")
+                .data(serde_json::to_string(&batch).unwrap_or_default());
+
+            yield Ok(event);
+            return;
+        }
+
+        for (batch_idx, chunk) in results.chunks(batch_size).enumerate() {
+            let mut batch_results = Vec::with_capacity(chunk.len());
+
+            for &(id, score) in chunk {
+                let mut result = StreamSearchResultItem {
+                    id,
+                    score,
+                    vector: None,
+                    metadata: None,
+                };
+
+                if include_vectors {
+                    if let Ok(v) = vector_store.get(id) {
+                        result.vector = Some(v);
+                    }
+                }
+
+                if include_metadata {
+                    let meta = metadata_store.get_all(id);
+                    if !meta.is_empty() {
+                        result.metadata = Some(meta);
+                    }
+                }
+
+                batch_results.push(result);
+            }
+
+            results_sent += batch_results.len() as u32;
+            let is_last = batch_idx == total_batches.saturating_sub(1);
+
+            let batch = StreamSearchResultBatch {
+                results: batch_results,
+                batch_index: batch_idx as u32,
+                total_batches: total_batches as u32,
+                results_so_far: results_sent,
+                total_results: total_results as u32,
+                is_last,
+            };
+
+            let event = Event::default()
+                .event("batch")
+                .data(serde_json::to_string(&batch).unwrap_or_default());
+
+            yield Ok(event);
+        }
+
+        // Final complete event
+        let complete = serde_json::json!({
+            "total_results": total_results,
+            "batches_sent": total_batches,
+            "success": true
+        });
+
+        let done_event = Event::default()
+            .event("complete")
+            .data(serde_json::to_string(&complete).unwrap_or_default());
+
+        yield Ok(done_event);
+    };
+
+    Ok(Sse::new(stream))
+}
+
+/// Hybrid search combining vector similarity with BM25 text search.
+async fn collection_hybrid_search(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<HybridSearchReq>,
+) -> Result<Json<HybridSearchResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let k = payload.k as usize;
+    let alpha = payload.alpha.unwrap_or(0.5).clamp(0.0, 1.0);
+    let use_rrf = payload.fusion_method.as_deref() == Some("rrf");
+    let include_scores = payload.include_scores;
+    let include_metadata = payload.include_metadata;
+
+    // Build filter bitmap for metadata filters
+    let mut filter_bitmap: Option<roaring::RoaringBitmap> = None;
+
+    // String field filters
+    if !payload.filter.is_empty() {
+        let conditions: Vec<(&str, &str)> = payload.filter
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        if let Some(indexed_bitmap) = collection.metadata_store.try_filter_and(&conditions) {
+            filter_bitmap = Some(indexed_bitmap);
+        }
+    }
+
+    // Range filters
+    if !payload.range_filters.is_empty() {
+        if let Some(indexed_store) = collection.metadata_store
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::storage::IndexedSledMetadataStore>())
+        {
+            if let Some(range_bitmap) = apply_range_filters(indexed_store, &payload.range_filters) {
+                filter_bitmap = Some(
+                    filter_bitmap
+                        .map(|existing| existing & &range_bitmap)
+                        .unwrap_or(range_bitmap)
+                );
+            }
+        }
+    }
+
+    // Perform hybrid search
+    let results = collection.hybrid_search_filtered(
+        &payload.vector,
+        &payload.query,
+        k,
+        alpha,
+        use_rrf,
+        filter_bitmap.as_ref(),
+    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Convert to response
+    let response_results: Vec<HybridSearchResult> = results
+        .into_iter()
+        .map(|r| {
+            let metadata = if include_metadata {
+                let meta = collection.metadata_store.get_all(r.id);
+                if meta.is_empty() { None } else { Some(meta) }
+            } else {
+                None
+            };
+
+            HybridSearchResult {
+                id: r.id,
+                combined_score: r.combined_score,
+                vector_score: if include_scores { Some(r.vector_score) } else { None },
+                text_score: if include_scores { Some(r.text_score) } else { None },
+                metadata,
+            }
+        })
+        .collect();
+
+    Ok(Json(HybridSearchResp {
+        results: response_results,
+        total_candidates: (k * 2) as u32,
+    }))
+}
+
+/// Text-only search using BM25 algorithm.
+async fn collection_text_search(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<TextSearchReq>,
+) -> Result<Json<TextSearchResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let k = payload.k as usize;
+    let include_metadata = payload.include_metadata;
+
+    // Perform text search
+    let results = collection.text_search(&payload.query, k)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Apply metadata filter if present
+    let filtered_results: Vec<_> = if !payload.filter.is_empty() {
+        results.into_iter()
+            .filter(|r| {
+                payload.filter.iter().all(|(fk, fv)| {
+                    collection.metadata_store
+                        .get(r.id, fk)
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        .map(|v| v == fv)
+                        .unwrap_or(false)
+                })
+            })
+            .collect()
+    } else {
+        results
+    };
+
+    // Convert to response
+    let response_results: Vec<TextSearchResultItem> = filtered_results
+        .into_iter()
+        .map(|r| {
+            let metadata = if include_metadata {
+                let meta = collection.metadata_store.get_all(r.id);
+                if meta.is_empty() { None } else { Some(meta) }
+            } else {
+                None
+            };
+
+            TextSearchResultItem {
+                id: r.id,
+                score: r.score,
+                metadata,
+            }
+        })
+        .collect();
+
+    Ok(Json(TextSearchResp {
+        results: response_results,
+    }))
+}
+
+/// Multi-vector search - search with multiple query vectors and fuse results.
+async fn collection_multi_search(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<MultiVectorSearchReq>,
+) -> Result<Json<MultiVectorSearchResp>, StatusCode> {
+    use crate::index::multi_vector::{MultiVectorQuery, FusionMethod, parallel_multi_search};
+
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let k = payload.k as usize;
+    let fusion = FusionMethod::from_str(&payload.fusion);
+    let include_per_query = payload.include_per_query_scores;
+    let include_metadata = payload.include_metadata;
+
+    // Build query
+    let mut query = MultiVectorQuery::new(payload.vectors.clone(), k)
+        .with_fusion(fusion)
+        .with_rrf_k(payload.rrf_k)
+        .with_oversample(payload.oversample as usize);
+
+    if let Some(weights) = payload.weights {
+        query = query.with_weights(weights);
+    }
+
+    // Build filter bitmap if provided
+    let filter_bitmap: Option<roaring::RoaringBitmap> = if !payload.filter.is_empty() {
+        // Convert filter to conditions slice format
+        let conditions: Vec<(&str, &str)> = payload.filter
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        collection.metadata_store.try_filter_and(&conditions)
+    } else {
+        None
+    };
+
+    // Exclude deleted IDs from filter
+    let deleted = collection.deleted_bitmap();
+    let effective_filter = if !deleted.is_empty() {
+        let total = collection.len() as u64;
+        let mut universe = roaring::RoaringBitmap::new();
+        universe.insert_range(0..total as u32);
+        let allowed = &universe - &deleted;
+
+        match filter_bitmap {
+            Some(f) => Some(&f & &allowed),
+            None => Some(allowed),
+        }
+    } else {
+        filter_bitmap
+    };
+
+    // Perform multi-vector search
+    let results = parallel_multi_search(
+        &collection.indexer,
+        &query,
+        effective_filter.as_ref(),
+    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Convert to response
+    let response_results: Vec<MultiVectorSearchResult> = results
+        .into_iter()
+        .map(|r| {
+            let metadata = if include_metadata {
+                let meta = collection.metadata_store.get_all(r.id);
+                if meta.is_empty() { None } else { Some(meta) }
+            } else {
+                None
+            };
+
+            MultiVectorSearchResult {
+                id: r.id,
+                score: r.score,
+                query_matches: r.query_matches,
+                per_query_scores: if include_per_query {
+                    Some(r.per_query_scores)
+                } else {
+                    None
+                },
+                metadata,
+            }
+        })
+        .collect();
+
+    Ok(Json(MultiVectorSearchResp {
+        results: response_results,
+        num_queries: payload.vectors.len(),
+        fusion_method: payload.fusion,
+    }))
+}
+
+// =============================================================================
+// Sparse Vector Handlers
+// =============================================================================
+
+/// Sparse index storage - one per collection.
+/// Uses lazy initialization via a global map.
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
+use std::collections::HashMap as StdHashMap;
+
+static SPARSE_INDICES: Lazy<Mutex<StdHashMap<String, crate::sparse::ThreadSafeSparseIndex>>> =
+    Lazy::new(|| Mutex::new(StdHashMap::new()));
+
+fn get_or_create_sparse_index(collection_name: &str) -> crate::sparse::ThreadSafeSparseIndex {
+    let mut indices = SPARSE_INDICES.lock().unwrap();
+    indices
+        .entry(collection_name.to_string())
+        .or_insert_with(crate::sparse::ThreadSafeSparseIndex::new)
+        .clone()
+}
+
+/// Insert a sparse vector into a collection.
+async fn collection_sparse_upsert(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<SparseUpsertReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Verify collection exists
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Get or create sparse index for this collection
+    let sparse_index = get_or_create_sparse_index(&name);
+
+    // Create sparse vector
+    let sparse_vec = crate::sparse::SparseVector::new(payload.indices, payload.values)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Generate ID (use next available from collection)
+    let id = collection.len() as u64;
+
+    // Insert into sparse index
+    sparse_index.insert(id, sparse_vec)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Store metadata
+    for (k, v) in payload.metadata {
+        collection.metadata_store.insert(id, k, v)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "collection": name,
+        "success": true
+    })))
+}
+
+/// Batch insert sparse vectors.
+async fn collection_sparse_upsert_batch(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<SparseBatchUpsertReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Verify collection exists
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Get or create sparse index
+    let sparse_index = get_or_create_sparse_index(&name);
+
+    let start_id = collection.len() as u64;
+    let count = payload.vectors.len();
+
+    // Prepare batch
+    let mut batch: Vec<(u64, crate::sparse::SparseVector)> = Vec::with_capacity(count);
+    let mut metadata_batch: Vec<(u64, std::collections::HashMap<String, String>)> = Vec::with_capacity(count);
+
+    for (i, v) in payload.vectors.into_iter().enumerate() {
+        let id = start_id + i as u64;
+        let sparse_vec = crate::sparse::SparseVector::new(v.indices, v.values)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        batch.push((id, sparse_vec));
+        metadata_batch.push((id, v.metadata));
+    }
+
+    // Batch insert sparse vectors
+    sparse_index.insert_batch(&batch)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Insert metadata
+    for (id, metadata) in metadata_batch {
+        for (k, v) in metadata {
+            collection.metadata_store.insert(id, k, v)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "start_id": start_id,
+        "count": count,
+        "success": true
+    })))
+}
+
+/// Search sparse vectors.
+async fn collection_sparse_search(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<SparseSearchReq>,
+) -> Result<Json<SparseSearchResp>, StatusCode> {
+    // Verify collection exists
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Get sparse index
+    let sparse_index = get_or_create_sparse_index(&name);
+
+    if sparse_index.is_empty() {
+        return Ok(Json(SparseSearchResp { results: vec![] }));
+    }
+
+    // Create query vector
+    let query = crate::sparse::SparseVector::new(payload.indices, payload.values)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let k = payload.k as usize;
+    let include_metadata = payload.include_metadata;
+
+    // Search
+    let results = sparse_index.search(&query, k);
+
+    // Apply filter if present (post-filter for now)
+    let filtered_results: Vec<_> = if !payload.filter.is_empty() {
+        results.into_iter()
+            .filter(|(id, _)| {
+                payload.filter.iter().all(|(fk, fv)| {
+                    collection.metadata_store
+                        .get(*id, fk)
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        .map(|v| v == fv)
+                        .unwrap_or(false)
+                })
+            })
+            .collect()
+    } else {
+        results
+    };
+
+    // Convert to response
+    let response_results: Vec<SparseSearchResult> = filtered_results
+        .into_iter()
+        .map(|(id, score)| {
+            let metadata = if include_metadata {
+                let meta = collection.metadata_store.get_all(id);
+                if meta.is_empty() { None } else { Some(meta) }
+            } else {
+                None
+            };
+
+            SparseSearchResult { id, score, metadata }
+        })
+        .collect();
+
+    Ok(Json(SparseSearchResp { results: response_results }))
+}
+
+/// Hybrid dense + sparse search.
+async fn collection_hybrid_dense_sparse(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<HybridDenseSparseReq>,
+) -> Result<Json<HybridDenseSparseResp>, StatusCode> {
+    use crate::sparse::{HybridSearchConfig, HybridFusion, fuse_hybrid_results};
+
+    // Verify collection exists
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let k = payload.k as usize;
+    let include_scores = payload.include_scores;
+    let include_metadata = payload.include_metadata;
+
+    // Build filter bitmap
+    let filter_bitmap: Option<roaring::RoaringBitmap> = if !payload.filter.is_empty() {
+        let conditions: Vec<(&str, &str)> = payload.filter
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        collection.metadata_store.try_filter_and(&conditions)
+    } else {
+        None
+    };
+
+    // Exclude deleted IDs
+    let deleted = collection.deleted_bitmap();
+    let effective_filter = if !deleted.is_empty() {
+        let total = collection.len() as u64;
+        let mut universe = roaring::RoaringBitmap::new();
+        universe.insert_range(0..total as u32);
+        let allowed = &universe - &deleted;
+        match filter_bitmap {
+            Some(f) => Some(&f & &allowed),
+            None => Some(allowed),
+        }
+    } else {
+        filter_bitmap
+    };
+
+    // Dense search
+    let oversample = 3; // Fetch more candidates for fusion
+    let dense_results = collection.indexer
+        .search(&payload.dense_vector, k * oversample, effective_filter.as_ref())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Sparse search
+    let sparse_index = get_or_create_sparse_index(&name);
+    let sparse_query = crate::sparse::SparseVector::new(
+        payload.sparse_indices.clone(),
+        payload.sparse_values.clone(),
+    ).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let sparse_results = if let Some(ref filter) = effective_filter {
+        sparse_index.search_filtered(&sparse_query, k * oversample, filter)
+    } else {
+        sparse_index.search(&sparse_query, k * oversample)
+    };
+
+    // Fuse results
+    let config = HybridSearchConfig {
+        dense_weight: payload.dense_weight,
+        sparse_weight: payload.sparse_weight,
+        fusion: HybridFusion::from_str(&payload.fusion),
+        oversample,
+    };
+
+    let fused = fuse_hybrid_results(&dense_results, &sparse_results, &config, k);
+
+    // Convert to response
+    let response_results: Vec<HybridDenseSparseResult> = fused
+        .into_iter()
+        .map(|r| {
+            let metadata = if include_metadata {
+                let meta = collection.metadata_store.get_all(r.id);
+                if meta.is_empty() { None } else { Some(meta) }
+            } else {
+                None
+            };
+
+            HybridDenseSparseResult {
+                id: r.id,
+                score: r.score,
+                dense_score: if include_scores { r.dense_score } else { None },
+                sparse_score: if include_scores { r.sparse_score } else { None },
+                metadata,
+            }
+        })
+        .collect();
+
+    Ok(Json(HybridDenseSparseResp {
+        results: response_results,
+        fusion_method: payload.fusion,
+    }))
+}
+
+// =============================================================================
+// Versioning Handlers
+// =============================================================================
+
+/// Versioned store storage - one per collection.
+static VERSIONED_STORES: Lazy<Mutex<StdHashMap<String, crate::versioning::ThreadSafeVersionedStore>>> =
+    Lazy::new(|| Mutex::new(StdHashMap::new()));
+
+fn get_or_create_versioned_store(collection_name: &str, dim: usize) -> crate::versioning::ThreadSafeVersionedStore {
+    let mut stores = VERSIONED_STORES.lock().unwrap();
+    stores
+        .entry(collection_name.to_string())
+        .or_insert_with(|| crate::versioning::ThreadSafeVersionedStore::new(dim))
+        .clone()
+}
+
+/// Insert or update a versioned vector.
+async fn versioned_upsert(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<VersionedUpsertReq>,
+) -> Result<Json<VersionInfoResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let store = get_or_create_versioned_store(&name, collection.config.dim);
+
+    let version = store.upsert_with_description(
+        payload.vector_id,
+        payload.vector,
+        payload.metadata,
+        payload.description.as_deref(),
+    ).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    Ok(Json(version.into()))
+}
+
+/// Get the latest version of a vector.
+async fn versioned_get(
+    State(state): State<Arc<CollectionAppState>>,
+    Path((name, vector_id)): Path<(String, u64)>,
+) -> Result<Json<VersionInfoResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let store = get_or_create_versioned_store(&name, collection.config.dim);
+
+    let version = store.get(vector_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(version.into()))
+}
+
+/// Get version history for a vector.
+async fn versioned_history(
+    State(state): State<Arc<CollectionAppState>>,
+    Path((name, vector_id)): Path<(String, u64)>,
+) -> Result<Json<Vec<VersionInfoResp>>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let store = get_or_create_versioned_store(&name, collection.config.dim);
+
+    let history = store.get_history(vector_id);
+    if history.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let response: Vec<VersionInfoResp> = history.into_iter().map(|v| v.into()).collect();
+    Ok(Json(response))
+}
+
+/// Get vector at a specific timestamp.
+async fn versioned_at_timestamp(
+    State(state): State<Arc<CollectionAppState>>,
+    Path((name, vector_id)): Path<(String, u64)>,
+    Json(payload): Json<GetAtTimestampReq>,
+) -> Result<Json<VersionInfoResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let store = get_or_create_versioned_store(&name, collection.config.dim);
+
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&payload.timestamp)
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .with_timezone(&chrono::Utc);
+
+    let version = store.get_at_timestamp(vector_id, timestamp)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(version.into()))
+}
+
+/// Rollback a vector to a previous version.
+async fn versioned_rollback(
+    State(state): State<Arc<CollectionAppState>>,
+    Path((name, vector_id)): Path<(String, u64)>,
+    Json(payload): Json<RollbackReq>,
+) -> Result<Json<VersionInfoResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let store = get_or_create_versioned_store(&name, collection.config.dim);
+
+    let version = store.rollback(vector_id, payload.to_version_id)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    Ok(Json(version.into()))
+}
+
+/// Get snapshot of all vectors at a timestamp.
+async fn versioned_snapshot(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+    Json(payload): Json<SnapshotAtReq>,
+) -> Result<Json<Vec<VersionInfoResp>>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let store = get_or_create_versioned_store(&name, collection.config.dim);
+
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&payload.timestamp)
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .with_timezone(&chrono::Utc);
+
+    let snapshot = store.snapshot_at(timestamp);
+    let response: Vec<VersionInfoResp> = snapshot.into_iter().map(|v| v.into()).collect();
+
+    Ok(Json(response))
+}
+
+/// Get versioning statistics.
+async fn versioned_stats(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<crate::versioning::VersioningStats>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let store = get_or_create_versioned_store(&name, collection.config.dim);
+
+    Ok(Json(store.stats()))
+}
+
 /// Update a vector (delete old + insert new).
 /// Returns the new ID since vectors are append-only.
 async fn collection_update_vector(
@@ -851,6 +2066,92 @@ async fn collection_compact(
         bytes_reclaimed: result.bytes_reclaimed,
         success: true,
     }))
+}
+
+// ============================================================================
+// Checkpoint Handlers (WAL)
+// ============================================================================
+
+/// Response for checkpoint operations.
+#[derive(Serialize)]
+pub struct CheckpointResp {
+    collection: String,
+    sequence: u64,
+    success: bool,
+}
+
+/// Response for WAL stats.
+#[derive(Serialize)]
+pub struct WalStatsResp {
+    collection: String,
+    enabled: bool,
+    sequence: Option<u64>,
+    last_checkpoint: Option<u64>,
+    entries_since_checkpoint: Option<u64>,
+    file_size: Option<u64>,
+}
+
+/// Create a checkpoint for a collection.
+/// This saves the index and WAL marker, allowing old WAL entries to be truncated.
+async fn collection_checkpoint(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<CheckpointResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let sequence = collection.checkpoint()
+        .map_err(|e| {
+            eprintln!("Checkpoint error: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(CheckpointResp {
+        collection: name,
+        sequence,
+        success: true,
+    }))
+}
+
+/// Get WAL statistics for a collection.
+async fn collection_wal_stats(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<WalStatsResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let wal_stats = collection.wal_stats();
+    let info = collection.info();
+
+    Ok(Json(WalStatsResp {
+        collection: name,
+        enabled: info.wal_enabled,
+        sequence: wal_stats.as_ref().map(|s| s.sequence),
+        last_checkpoint: wal_stats.as_ref().map(|s| s.last_checkpoint),
+        entries_since_checkpoint: wal_stats.as_ref().map(|s| s.entries_since_checkpoint),
+        file_size: wal_stats.map(|s| s.file_size),
+    }))
+}
+
+/// Checkpoint all response.
+#[derive(Serialize)]
+pub struct CheckpointAllResp {
+    checkpointed: Vec<String>,
+    success: bool,
+}
+
+/// Create checkpoints for all collections.
+async fn checkpoint_all(
+    State(state): State<Arc<CollectionAppState>>,
+) -> Json<CheckpointAllResp> {
+    let _ = state.manager.checkpoint_all();
+    let names = state.manager.names();
+
+    Json(CheckpointAllResp {
+        checkpointed: names,
+        success: true,
+    })
 }
 
 // ============================================================================
@@ -1343,4 +2644,321 @@ async fn prometheus_metrics(
         [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
+}
+
+// ============================================================================
+// SIMD Info Handler
+// ============================================================================
+
+/// SIMD capability info response.
+#[derive(Serialize)]
+pub struct SimdInfoResp {
+    pub level: String,
+    pub l2_implementation: String,
+    pub dot_implementation: String,
+    pub features: Vec<String>,
+}
+
+/// Get SIMD capability information.
+/// Returns the detected SIMD level and available implementations.
+async fn simd_info() -> Json<SimdInfoResp> {
+    let info = crate::simd::simd_info();
+
+    let mut features = Vec::new();
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            features.push("avx2".to_string());
+        }
+        if is_x86_feature_detected!("avx") {
+            features.push("avx".to_string());
+        }
+        if is_x86_feature_detected!("fma") {
+            features.push("fma".to_string());
+        }
+        if is_x86_feature_detected!("sse4.1") {
+            features.push("sse4.1".to_string());
+        }
+        if is_x86_feature_detected!("sse4.2") {
+            features.push("sse4.2".to_string());
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        features.push("neon".to_string());
+    }
+
+    Json(SimdInfoResp {
+        level: info.level.as_str().to_string(),
+        l2_implementation: info.l2_impl.to_string(),
+        dot_implementation: info.dot_impl.to_string(),
+        features,
+    })
+}
+
+// ============================================================================
+// Sharding Management Handlers
+// ============================================================================
+
+use crate::sharding::{ShardConfig, ShardingConfig, ShardRouter};
+
+/// Sharding status response (uses ShardingStatus from sharding module).
+#[derive(Serialize)]
+pub struct ShardingStatusResp {
+    pub enabled: bool,
+    pub strategy: String,
+    pub num_shards: u32,
+    pub local_shards: u32,
+    pub local_node: String,
+    pub shard_details: Vec<ShardDetailResp>,
+}
+
+/// Shard detail for API responses.
+#[derive(Serialize)]
+pub struct ShardDetailResp {
+    pub shard_id: u32,
+    pub node: String,
+    pub collection: String,
+    pub is_primary: bool,
+    pub is_local: bool,
+    pub vector_count: Option<u64>,
+}
+
+/// Request to add a new shard.
+#[derive(Deserialize)]
+pub struct AddShardReq {
+    pub shard_id: u32,
+    pub collection: String,
+    #[serde(default = "default_node")]
+    pub node: String,
+    #[serde(default = "default_true")]
+    pub is_primary: bool,
+}
+
+fn default_node() -> String { "local".to_string() }
+fn default_true() -> bool { true }
+
+/// Route info response.
+#[derive(Serialize)]
+pub struct RouteInfoResp {
+    pub vector_id: u64,
+    pub shard_id: u32,
+    pub is_local: bool,
+    pub collection_name: Option<String>,
+    pub node: Option<String>,
+}
+
+/// Global sharding state (using std::sync::LazyLock).
+static SHARD_ROUTER: std::sync::LazyLock<parking_lot::RwLock<Option<ShardRouter>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(None));
+
+/// Initialize sharding with config.
+pub fn init_sharding(config: ShardingConfig, local_node: &str) {
+    let mut router = SHARD_ROUTER.write();
+    *router = Some(ShardRouter::new(config, local_node.to_string()));
+}
+
+/// Initialize local-only sharding.
+pub fn init_local_sharding(num_shards: u32, base_collection: &str) {
+    let mut router = SHARD_ROUTER.write();
+    *router = Some(ShardRouter::local(num_shards, base_collection));
+}
+
+/// Get sharding configuration/status.
+async fn get_sharding_config(
+    State(state): State<Arc<CollectionAppState>>,
+) -> Result<Json<ShardingStatusResp>, StatusCode> {
+    let router = SHARD_ROUTER.read();
+    let router = router.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let status = router.status();
+
+    let shard_details: Vec<ShardDetailResp> = status.shard_details.iter().map(|s| {
+        let is_local = router.is_local_shard(s.id);
+        let vector_count = if is_local {
+            state.manager.get(&s.collection).map(|c| c.len() as u64)
+        } else {
+            None
+        };
+
+        ShardDetailResp {
+            shard_id: s.id,
+            node: s.node.clone(),
+            collection: s.collection.clone(),
+            is_primary: s.is_primary,
+            is_local,
+            vector_count,
+        }
+    }).collect();
+
+    Ok(Json(ShardingStatusResp {
+        enabled: status.enabled,
+        strategy: format!("{:?}", status.strategy),
+        num_shards: status.num_shards,
+        local_shards: status.local_shards,
+        local_node: status.local_node,
+        shard_details,
+    }))
+}
+
+/// Update sharding configuration - rebuild with new config.
+async fn update_sharding_config(
+    State(state): State<Arc<CollectionAppState>>,
+    Json(payload): Json<ShardingConfig>,
+) -> Result<Json<ShardingStatusResp>, StatusCode> {
+    let mut router_guard = SHARD_ROUTER.write();
+    let old_router = router_guard.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let local_node = old_router.status().local_node.clone();
+
+    // Rebuild router with new config
+    *router_guard = Some(ShardRouter::new(payload, local_node.clone()));
+    let router = router_guard.as_ref().unwrap();
+
+    let status = router.status();
+    let shard_details: Vec<ShardDetailResp> = status.shard_details.iter().map(|s| {
+        let is_local = router.is_local_shard(s.id);
+        let vector_count = if is_local {
+            state.manager.get(&s.collection).map(|c| c.len() as u64)
+        } else {
+            None
+        };
+
+        ShardDetailResp {
+            shard_id: s.id,
+            node: s.node.clone(),
+            collection: s.collection.clone(),
+            is_primary: s.is_primary,
+            is_local,
+            vector_count,
+        }
+    }).collect();
+
+    Ok(Json(ShardingStatusResp {
+        enabled: status.enabled,
+        strategy: format!("{:?}", status.strategy),
+        num_shards: status.num_shards,
+        local_shards: status.local_shards,
+        local_node: status.local_node,
+        shard_details,
+    }))
+}
+
+/// List all shards.
+async fn list_shards(
+    State(state): State<Arc<CollectionAppState>>,
+) -> Result<Json<Vec<ShardDetailResp>>, StatusCode> {
+    let router = SHARD_ROUTER.read();
+    let router = router.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let status = router.status();
+    let shards: Vec<ShardDetailResp> = status.shard_details.iter().map(|s| {
+        let is_local = router.is_local_shard(s.id);
+        let vector_count = if is_local {
+            state.manager.get(&s.collection).map(|c| c.len() as u64)
+        } else {
+            None
+        };
+
+        ShardDetailResp {
+            shard_id: s.id,
+            node: s.node.clone(),
+            collection: s.collection.clone(),
+            is_primary: s.is_primary,
+            is_local,
+            vector_count,
+        }
+    }).collect();
+
+    Ok(Json(shards))
+}
+
+/// Get info about a specific shard.
+async fn get_shard_info(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(shard_id): Path<u32>,
+) -> Result<Json<ShardDetailResp>, StatusCode> {
+    let router = SHARD_ROUTER.read();
+    let router = router.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let shard_config = router.get_shard_config(shard_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let is_local = router.is_local_shard(shard_id);
+    let vector_count = if is_local {
+        state.manager.get(&shard_config.collection).map(|c| c.len() as u64)
+    } else {
+        None
+    };
+
+    Ok(Json(ShardDetailResp {
+        shard_id: shard_config.id,
+        node: shard_config.node,
+        collection: shard_config.collection,
+        is_primary: shard_config.is_primary,
+        is_local,
+        vector_count,
+    }))
+}
+
+/// Add a new shard.
+async fn add_shard(
+    Json(payload): Json<AddShardReq>,
+) -> Result<Json<ShardDetailResp>, StatusCode> {
+    let router = SHARD_ROUTER.read();
+    let router = router.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let shard_config = ShardConfig {
+        id: payload.shard_id,
+        node: payload.node.clone(),
+        collection: payload.collection.clone(),
+        replicas: Vec::new(),
+        is_primary: payload.is_primary,
+    };
+
+    router.add_shard(shard_config.clone());
+    let is_local = router.is_local_shard(payload.shard_id);
+
+    Ok(Json(ShardDetailResp {
+        shard_id: payload.shard_id,
+        node: payload.node,
+        collection: payload.collection,
+        is_primary: payload.is_primary,
+        is_local,
+        vector_count: None,
+    }))
+}
+
+/// Remove a shard.
+async fn remove_shard(
+    Path(shard_id): Path<u32>,
+) -> Result<StatusCode, StatusCode> {
+    let router = SHARD_ROUTER.read();
+    let router = router.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    router.remove_shard(shard_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Get shard for a vector ID.
+async fn get_shard_for_id(
+    Path(vector_id): Path<u64>,
+) -> Result<Json<RouteInfoResp>, StatusCode> {
+    let router = SHARD_ROUTER.read();
+    let router = router.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let shard_id = router.route_by_id(vector_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let is_local = router.is_local_shard(shard_id);
+    let collection_name = router.get_shard_collection(shard_id);
+    let node = router.get_shard_node(shard_id);
+
+    Ok(Json(RouteInfoResp {
+        vector_id,
+        shard_id,
+        is_local,
+        collection_name,
+        node,
+    }))
 }

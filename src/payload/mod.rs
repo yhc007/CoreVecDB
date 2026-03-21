@@ -8,11 +8,57 @@
 //! - Option/Result monads
 //! - Closures and higher-order functions
 //! - Pattern matching
+//!
+//! OPTIMIZATION: Uses fast_union helper to avoid intermediate bitmap allocations.
 
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Fast union of multiple bitmaps without intermediate allocations.
+/// Collects all bitmaps first, then unions into a single result.
+/// This is more efficient than fold which creates intermediate bitmaps.
+#[inline]
+fn fast_union<'a, I>(bitmaps: I) -> RoaringBitmap
+where
+    I: IntoIterator<Item = &'a RoaringBitmap>,
+{
+    let bitmaps: Vec<&RoaringBitmap> = bitmaps.into_iter().collect();
+    if bitmaps.is_empty() {
+        return RoaringBitmap::new();
+    }
+    if bitmaps.len() == 1 {
+        return bitmaps[0].clone();
+    }
+
+    // Start with clone of first, then use bitor_assign for rest
+    // This avoids creating intermediate bitmaps
+    let mut result = bitmaps[0].clone();
+    for bitmap in bitmaps.iter().skip(1) {
+        result |= *bitmap;
+    }
+    result
+}
+
+/// Fast union from iterator of owned bitmaps.
+#[inline]
+fn fast_union_owned<I>(bitmaps: I) -> RoaringBitmap
+where
+    I: IntoIterator<Item = RoaringBitmap>,
+{
+    let mut iter = bitmaps.into_iter();
+    match iter.next() {
+        None => RoaringBitmap::new(),
+        Some(first) => {
+            let mut result = first;
+            for bitmap in iter {
+                result |= bitmap;
+            }
+            result
+        }
+    }
+}
 
 /// Inverted index for a single field.
 /// Maps field values to sets of vector IDs containing that value.
@@ -62,16 +108,17 @@ impl FieldIndex {
     }
 
     /// Get all IDs matching any of the values (OR).
-    /// Functional: fold over iterator to union bitmaps.
+    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_any<'a, I>(&self, values: I) -> RoaringBitmap
     where
         I: IntoIterator<Item = &'a str>,
     {
         let index = self.index.read();
-        values
+        let bitmaps: Vec<&RoaringBitmap> = values
             .into_iter()
             .filter_map(|v| index.get(v))
-            .fold(RoaringBitmap::new(), |acc, bitmap| &acc | bitmap)
+            .collect();
+        fast_union(bitmaps)
     }
 
     /// Get all IDs matching all of the values (AND).
@@ -247,60 +294,70 @@ impl NumericFieldIndex {
     }
 
     /// Get IDs > value.
-    /// Functional: range iterator with fold.
+    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_gt(&self, value: i64) -> RoaringBitmap {
         let index = self.index.read();
-        index
+        let bitmaps: Vec<&RoaringBitmap> = index
             .range((std::ops::Bound::Excluded(value), std::ops::Bound::Unbounded))
             .map(|(_, bitmap)| bitmap)
-            .fold(RoaringBitmap::new(), |acc, b| &acc | b)
+            .collect();
+        fast_union(bitmaps)
     }
 
     /// Get IDs >= value.
+    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_gte(&self, value: i64) -> RoaringBitmap {
         let index = self.index.read();
-        index
+        let bitmaps: Vec<&RoaringBitmap> = index
             .range(value..)
             .map(|(_, bitmap)| bitmap)
-            .fold(RoaringBitmap::new(), |acc, b| &acc | b)
+            .collect();
+        fast_union(bitmaps)
     }
 
     /// Get IDs < value.
+    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_lt(&self, value: i64) -> RoaringBitmap {
         let index = self.index.read();
-        index
+        let bitmaps: Vec<&RoaringBitmap> = index
             .range(..value)
             .map(|(_, bitmap)| bitmap)
-            .fold(RoaringBitmap::new(), |acc, b| &acc | b)
+            .collect();
+        fast_union(bitmaps)
     }
 
     /// Get IDs <= value.
+    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_lte(&self, value: i64) -> RoaringBitmap {
         let index = self.index.read();
-        index
+        let bitmaps: Vec<&RoaringBitmap> = index
             .range(..=value)
             .map(|(_, bitmap)| bitmap)
-            .fold(RoaringBitmap::new(), |acc, b| &acc | b)
+            .collect();
+        fast_union(bitmaps)
     }
 
     /// Get IDs in range [min, max] (inclusive).
-    /// Functional: uses BTreeMap range with fold.
+    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_range(&self, min: i64, max: i64) -> RoaringBitmap {
         let index = self.index.read();
-        index
+        let bitmaps: Vec<&RoaringBitmap> = index
             .range(min..=max)
             .map(|(_, bitmap)| bitmap)
-            .fold(RoaringBitmap::new(), |acc, b| &acc | b)
+            .collect();
+        fast_union(bitmaps)
     }
 
     /// Get IDs in range (min, max) (exclusive).
+    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_range_exclusive(&self, min: i64, max: i64) -> RoaringBitmap {
         use std::ops::Bound;
         let index = self.index.read();
-        index
+        let bitmaps: Vec<&RoaringBitmap> = index
             .range((Bound::Excluded(min), Bound::Excluded(max)))
             .map(|(_, bitmap)| bitmap)
-            .fold(RoaringBitmap::new(), |acc, b| &acc | b)
+            .collect();
+        fast_union(bitmaps)
     }
 
     /// Get statistics.
@@ -686,15 +743,21 @@ impl PayloadIndex {
             }
 
             FilterQuery::Or(queries) => {
-                let result = queries
+                // OPTIMIZATION: Use fast_union_owned to avoid intermediate allocations
+                let bitmaps: Vec<RoaringBitmap> = queries
                     .iter()
                     .filter_map(|q| self.evaluate_query(q))
-                    .fold(RoaringBitmap::new(), |acc, bitmap| &acc | &bitmap);
+                    .collect();
 
-                if result.is_empty() {
+                if bitmaps.is_empty() {
                     None
                 } else {
-                    Some(result)
+                    let result = fast_union_owned(bitmaps);
+                    if result.is_empty() {
+                        None
+                    } else {
+                        Some(result)
+                    }
                 }
             }
 

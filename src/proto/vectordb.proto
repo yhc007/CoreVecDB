@@ -17,6 +17,16 @@ service VectorService {
   // Streaming operations
   rpc StreamUpsert (stream StreamUpsertRequest) returns (StreamUpsertResponse);
   rpc StreamUpsertBidi (stream StreamUpsertRequest) returns (stream StreamUpsertProgress);
+
+  // Streaming search - returns results in batches for large k values
+  rpc StreamSearch (StreamSearchRequest) returns (stream StreamSearchResponse);
+
+  // Hybrid search - combines vector similarity with text search
+  rpc HybridSearch (HybridSearchRequest) returns (HybridSearchResponse);
+
+  // Text-only search using BM25
+  rpc TextSearch (TextSearchRequest) returns (TextSearchResponse);
+
   rpc Get (GetRequest) returns (GetResponse);
   rpc Delete (DeleteRequest) returns (DeleteResponse);
   rpc DeleteBatch (DeleteBatchRequest) returns (DeleteBatchResponse);
@@ -48,6 +58,7 @@ message CreateCollectionRequest {
   bool quantization_enabled = 4;
   repeated string indexed_fields = 5;
   repeated string numeric_fields = 6;
+  repeated string text_fields = 7;  // Fields for BM25 text search
 }
 
 message CreateCollectionResponse {
@@ -74,6 +85,8 @@ message CollectionInfo {
   bool quantization_enabled = 6;
   repeated string indexed_fields = 7;
   repeated string numeric_fields = 8;
+  repeated string text_fields = 9;    // Fields for BM25 text search
+  uint64 text_indexed_count = 10;     // Number of documents in text index
 }
 
 message DeleteCollectionRequest {
@@ -169,6 +182,87 @@ message SearchResult {
 
 message SearchResponse {
   repeated SearchResult results = 1;
+}
+
+// Streaming search request for large result sets
+message StreamSearchRequest {
+  string collection = 1;
+  Vector vector = 2;
+  uint32 k = 3;                           // Total number of results
+  map<string, string> filter = 4;
+  repeated uint64 filter_ids = 5;
+  repeated RangeFilter range_filters = 6;
+
+  // Streaming options
+  uint32 batch_size = 7;                  // Results per batch (default: 100)
+  bool include_vectors = 8;               // Include vectors in results
+  bool include_metadata = 9;              // Include metadata in results
+}
+
+// Enhanced search result with optional vector and metadata
+message StreamSearchResult {
+  uint64 id = 1;
+  float score = 2;
+  Vector vector = 3;                      // Included if include_vectors=true
+  map<string, string> metadata = 4;       // Included if include_metadata=true
+}
+
+// Streaming search response - sent multiple times
+message StreamSearchResponse {
+  repeated StreamSearchResult results = 1;  // Batch of results
+  uint32 batch_index = 2;                  // Current batch number (0-indexed)
+  uint32 total_batches = 3;                // Total number of batches
+  uint32 results_so_far = 4;               // Cumulative results sent
+  uint32 total_results = 5;                // Total results to be sent
+  bool is_last = 6;                        // True if this is the last batch
+}
+
+// ============================================================================
+// Hybrid Search (Vector + Text)
+// ============================================================================
+
+message HybridSearchRequest {
+  string collection = 1;
+  Vector vector = 2;                       // Query vector
+  string query = 3;                        // Text query for BM25
+  uint32 k = 4;                            // Number of results
+  float alpha = 5;                         // Weight for vector score (0.0-1.0, default 0.5)
+  string fusion_method = 6;                // "weighted" or "rrf" (default: "weighted")
+  map<string, string> filter = 7;          // Metadata filter
+  repeated RangeFilter range_filters = 8;  // Numeric filters
+  bool include_scores = 9;                 // Include individual scores in response
+}
+
+message HybridSearchResult {
+  uint64 id = 1;
+  float combined_score = 2;
+  float vector_score = 3;                  // Included if include_scores=true
+  float text_score = 4;                    // Included if include_scores=true
+  map<string, string> metadata = 5;
+}
+
+message HybridSearchResponse {
+  repeated HybridSearchResult results = 1;
+  uint32 total_candidates = 2;             // Total candidates before fusion
+}
+
+// Text-only search using BM25
+message TextSearchRequest {
+  string collection = 1;
+  string query = 2;                        // Text query
+  uint32 k = 3;                            // Number of results
+  map<string, string> filter = 4;          // Metadata filter
+  bool must_match_all = 5;                 // Require all terms (AND logic)
+}
+
+message TextSearchResult {
+  uint64 id = 1;
+  float score = 2;
+  map<string, string> metadata = 3;
+}
+
+message TextSearchResponse {
+  repeated TextSearchResult results = 1;
 }
 
 message GetRequest {
