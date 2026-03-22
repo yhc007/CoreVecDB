@@ -217,6 +217,301 @@ Static files served from `ui/` directory at root
 - **`filter_ids`**: Uses `from_sorted_iter` for O(n) bitmap creation
 - **`filter_id_range`**: Uses `insert_range` for O(1) contiguous range filters
 
+### Query Layer Caching (`src/cache/`)
+
+#### Query Result Cache
+LRU cache for search results with TTL-based expiration.
+
+```rust
+use vectordb::cache::{QueryCache, QueryCacheKey};
+
+let cache = QueryCache::new(1000, Duration::from_secs(60));
+
+// Cache key includes: collection, vector_hash, k, filter_hash
+let key = QueryCacheKey::new("products", &query_vector, 10, &filter);
+
+// Check cache
+if let Some(results) = cache.get(&key) {
+    return results;
+}
+
+// Store in cache
+cache.put(key, results.clone());
+```
+
+Configuration:
+```toml
+[cache]
+query_cache_enabled = true
+query_cache_size = 1000      # Max cached queries
+query_cache_ttl_seconds = 60 # TTL in seconds
+```
+
+#### Filter Bitmap Cache
+Caches RoaringBitmap results for repeated filter conditions.
+
+```rust
+use vectordb::cache::{FilterBitmapCache, FilterCacheStats};
+
+let cache = FilterBitmapCache::new(500);
+
+// Cache filter results
+let filter = vec![("category".into(), "electronics".into())];
+cache.put(&filter, bitmap.clone());
+
+// Retrieve cached bitmap
+let bitmap = cache.get(&filter);
+
+// Field-level invalidation on insert/update
+cache.invalidate_field("category");
+```
+
+### Query Planning (`src/query/planner.rs`)
+
+Estimates filter selectivity and optimizes filter ordering.
+
+```rust
+use vectordb::query::{QueryPlanner, FilterOrder, FilterStrategy};
+
+let planner = QueryPlanner::new();
+
+// Observe field values during insert
+planner.observe_field("category", "electronics");
+planner.observe_field("status", "active");
+
+// Estimate selectivity (0.0 = very selective, 1.0 = no filtering)
+let selectivity = planner.estimate_selectivity("category", "electronics");
+
+// Optimize filter order (most selective first)
+let filters = vec![
+    FilterOrder::new("status", "active"),      // 90% of vectors
+    FilterOrder::new("category", "electronics"), // 10% of vectors
+];
+let optimized = planner.optimize_filter_order(filters);
+// Result: ["category", "status"] - electronics filter applied first
+
+// Get recommended strategy
+let plan = planner.plan_filters(filters);
+match plan.strategy {
+    FilterStrategy::PreFilter => // selectivity < 10%
+    FilterStrategy::Hybrid => // 10-50%
+    FilterStrategy::PostFilter => // > 50%
+    FilterStrategy::NoFilter => // 100%
+}
+```
+
+### Adaptive Index Selection (`src/index/adaptive.rs`)
+
+Automatically switches between brute-force and HNSW based on collection size.
+
+```rust
+use vectordb::index::adaptive::{AdaptiveIndexer, AdaptiveIndexConfig, IndexType};
+
+let config = AdaptiveIndexConfig {
+    enabled: true,
+    brute_force_threshold: 2000,  // Switch to HNSW at 2000 vectors
+    ..Default::default()
+};
+
+let indexer = AdaptiveIndexer::new(config, vector_store, 128);
+
+// Check current index type
+match indexer.current_type() {
+    IndexType::BruteForce => // SIMD-accelerated linear scan
+    IndexType::Hnsw => // Approximate nearest neighbor
+}
+
+// Insert triggers automatic switching
+let switched = indexer.insert(id, &vector)?;
+if switched {
+    println!("Switched to HNSW index");
+}
+
+// Search uses appropriate index
+let results = indexer.search(&query, 10, filter)?;
+```
+
+| Collection Size | Index Type | Reason |
+|-----------------|------------|--------|
+| < 2000 | Brute-force | Lower overhead, exact results |
+| >= 2000 | HNSW | Better scalability |
+
+### Index Pre-warming (`src/index/prewarm.rs`)
+
+Loads memory-mapped pages into OS cache for reduced cold-start latency.
+
+```rust
+use vectordb::index::prewarm::{prewarm_file, prewarm_collection, PrewarmConfig};
+
+let config = PrewarmConfig {
+    enabled: true,
+    max_pages: 0,       // 0 = load all pages
+    page_size: 4096,
+    sequential: true,   // Sequential access pattern
+};
+
+// Pre-warm a single file
+let stats = prewarm_file(Path::new("index.hnsw.graph"), &config)?;
+println!("Loaded {} pages ({} bytes)", stats.pages_loaded, stats.bytes_loaded);
+
+// Pre-warm entire collection
+let stats = prewarm_collection(Path::new("data/products"), &config)?;
+```
+
+Files pre-warmed:
+- `index.hnsw.graph` - HNSW graph structure
+- `index.hnsw.data` - HNSW node data
+- `vectors.bin` - Vector storage
+- `vectors.quant` - Quantized vectors
+
+### Upper Layer Cache (`src/index/layer_cache.rs`)
+
+Caches HNSW entry points and region seeds for faster search initialization.
+
+```rust
+use vectordb::index::layer_cache::{HnswLayerCache, LayerCacheConfig};
+
+let config = LayerCacheConfig {
+    max_entry_points: 100,
+    max_regions: 1000,
+    region_hash_dims: 8,   // First 8 dimensions for hashing
+    region_buckets: 10,
+};
+
+let cache = HnswLayerCache::new(config);
+
+// Add global entry points
+cache.add_entry_point(vector_id);
+
+// Get starting points for a query
+let starting_points = cache.get_starting_points(&query, 5);
+
+// Record successful search to update cache
+cache.record_success(&query, &results, entry_point_used);
+
+// Check statistics
+let stats = cache.stats();
+println!("Hit rate: {:.1}%", stats.hit_rate());
+```
+
+### Tiered Storage (`src/storage/tiered.rs`)
+
+Two-tier storage with hot (in-memory) and cold (mmap) tiers.
+
+```rust
+use vectordb::storage::tiered::{TieredVectorStore, TieredConfig};
+
+let config = TieredConfig {
+    enabled: true,
+    hot_tier_max_vectors: 10_000,
+    demotion_threshold_secs: 3600,  // 1 hour inactivity
+    promotion_access_threshold: 3,
+    promote_on_access: true,
+};
+
+let store = TieredVectorStore::new("data/vectors.bin", 128, config)?;
+
+// Insert (starts in hot tier)
+let id = store.insert(&vector)?;
+
+// Get (promotes to hot if in cold tier)
+let vector = store.get(id)?;
+
+// Run maintenance (demote stale vectors)
+store.maintain();
+
+// Check statistics
+let stats = store.stats();
+println!("Hot tier: {} vectors ({:.1}% hit rate)",
+         stats.hot_tier_vectors, stats.hot_hit_rate());
+println!("Promotions: {}, Demotions: {}",
+         stats.promotions, stats.demotions);
+```
+
+| Tier | Storage | Access Time | Capacity |
+|------|---------|-------------|----------|
+| Hot | In-memory HashMap | ~100ns | Configurable (default 10K) |
+| Cold | Memory-mapped file | ~1μs | Unlimited |
+
+### LZ4 Compression (`src/storage/compression.rs`)
+
+Block-based LZ4 compression for vector segments.
+
+```rust
+use vectordb::storage::compression::{CompressedSegment, CompressionConfig};
+
+let config = CompressionConfig {
+    block_size: 256,  // Vectors per block
+    enabled: true,
+};
+
+let mut segment = CompressedSegment::new(128, config);
+
+// Add vectors
+for vector in vectors {
+    segment.add_vector(&vector)?;
+}
+segment.finalize();
+
+// Random access (decompresses block on demand)
+let vector = segment.get_vector(42)?;
+
+// Check compression stats
+let stats = segment.stats();
+println!("Compression ratio: {:.1}%", stats.compression_ratio * 100.0);
+println!("Space saved: {:.1}%", stats.space_saved_percent);
+
+// Serialize/deserialize
+let bytes = segment.to_bytes()?;
+let restored = CompressedSegment::from_bytes(&bytes)?;
+```
+
+| Data Type | Typical Compression |
+|-----------|---------------------|
+| Random vectors | 60-80% of original |
+| Similar vectors | 20-40% of original |
+| Normalized vectors | 50-70% of original |
+
+### Segmented Storage (`src/storage/segmented.rs`)
+
+Fixed-size segments for better scalability and maintenance.
+
+```rust
+use vectordb::storage::segmented::{SegmentedVectorStore, SegmentConfig, SegmentState};
+
+let config = SegmentConfig {
+    segment_size: 100_000,  // Vectors per segment
+    auto_seal: true,
+    compress_sealed: false,
+};
+
+let store = SegmentedVectorStore::new("data/segments", 128, config)?;
+
+// Insert (routes to active segment)
+let global_id = store.insert(&vector)?;
+
+// Get (routes to correct segment)
+let vector = store.get(global_id)?;
+
+// Check segment info
+let stats = store.stats();
+for info in &stats.segment_infos {
+    println!("Segment {}: {:?}, {} vectors",
+             info.id, info.state, info.vector_count);
+}
+```
+
+**Global ID Encoding:**
+```
+global_id = segment_index * segment_size + local_id
+```
+
+| Segment State | Description |
+|---------------|-------------|
+| Active | Accepting new vectors |
+| Sealed | Read-only, full capacity |
+| Compressed | Sealed + LZ4 compressed |
+
 ## Scalar Quantization
 
 Reduces memory usage by 75% by compressing float32 vectors to uint8.
