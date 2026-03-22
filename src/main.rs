@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::path::Path;
 use tonic::transport::Server;
+use tracing::{error, info, warn};
 use vectordb::collection::CollectionManager;
 use vectordb::config::AppConfig;
 use vectordb::api::VectorServiceImpl;
@@ -14,79 +15,104 @@ async fn main() -> Result<()> {
 
     // Initialize metrics
     vectordb::metrics::init_metrics();
-    println!("Metrics initialized");
+    info!("Metrics initialized");
 
     // Load configuration
-    let config = AppConfig::load()?;
-    println!("Configuration loaded: {:?}", config);
+    let config = AppConfig::load().context("Failed to load configuration")?;
+    info!("Configuration loaded: {:?}", config);
 
     let data_dir = Path::new(&config.server.data_dir);
 
     // Create collection manager
-    let manager = Arc::new(CollectionManager::new(data_dir)?);
-    println!("Collection manager initialized");
-    println!("  - Collections: {:?}", manager.names());
+    let manager = Arc::new(
+        CollectionManager::new(data_dir).context("Failed to create collection manager")?
+    );
+    info!("Collection manager initialized");
+    info!("  - Collections: {:?}", manager.names());
 
     // gRPC Server
     let grpc_service = VectorServiceImpl::new(manager.clone());
-    let grpc_addr = format!("0.0.0.0:{}", config.server.grpc_port).parse()?;
-    println!("VectorDB gRPC listening on {}", grpc_addr);
+    let grpc_addr = format!("0.0.0.0:{}", config.server.grpc_port)
+        .parse()
+        .context("Invalid gRPC address")?;
+    info!("VectorDB gRPC listening on {}", grpc_addr);
 
     let grpc_handle = tokio::spawn(async move {
-        Server::builder()
+        if let Err(e) = Server::builder()
             .add_service(VectorServiceServer::new(grpc_service))
             .serve(grpc_addr)
             .await
-            .unwrap();
+        {
+            error!("gRPC server error: {:?}", e);
+        }
     });
 
     // HTTP Server with multi-collection support
     let http_router = vectordb::api::http::collection_router(manager.clone()).await;
     let http_addr = format!("0.0.0.0:{}", config.server.http_port);
-    println!("VectorDB HTTP listening on {}", http_addr);
+    info!("VectorDB HTTP listening on {}", http_addr);
 
+    let http_addr_clone = http_addr.clone();
     let http_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(&http_addr).await.unwrap();
-        axum::serve(listener, http_router).await.unwrap();
+        match tokio::net::TcpListener::bind(&http_addr_clone).await {
+            Ok(listener) => {
+                if let Err(e) = axum::serve(listener, http_router).await {
+                    error!("HTTP server error: {:?}", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to bind HTTP listener on {}: {:?}", http_addr_clone, e);
+            }
+        }
     });
 
     // Wait for shutdown signal
     shutdown_signal().await;
 
-    println!("Shutting down...");
+    info!("Shutting down...");
 
     // Flush all collections
-    if let Err(e) = manager.flush_all() {
-        eprintln!("Failed to flush collections: {:?}", e);
-    } else {
-        println!("All collections flushed successfully.");
+    match manager.flush_all() {
+        Ok(_) => info!("All collections flushed successfully."),
+        Err(e) => error!("Failed to flush collections: {:?}", e),
     }
 
     // Save all indexes
     if let Err(e) = manager.save_all_indexes() {
-        eprintln!("Failed to save indexes: {:?}", e);
+        error!("Failed to save indexes: {:?}", e);
+    } else {
+        info!("All indexes saved successfully.");
     }
 
-    // Abort servers
+    // Abort servers gracefully
     grpc_handle.abort();
     http_handle.abort();
 
+    info!("Shutdown complete.");
     Ok(())
 }
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        match tokio::signal::ctrl_c().await {
+            Ok(_) => info!("Received Ctrl+C signal"),
+            Err(e) => warn!("Failed to listen for Ctrl+C: {:?}", e),
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+                info!("Received terminate signal");
+            }
+            Err(e) => {
+                warn!("Failed to install SIGTERM handler: {:?}", e);
+                // Fall back to pending future so ctrl_c can still work
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

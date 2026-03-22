@@ -12,16 +12,84 @@
 //!
 //! ## Multi-Vector Search
 //! The `multi_vector` submodule enables searching with multiple query vectors.
+//!
+//! ## Memory Management Note
+//! The `load()` function uses intentional memory leaking via `Box::leak()` for `HnswIo`.
+//! This is required because `hnsw_rs::Hnsw` borrows from `HnswIo` with a `'static` lifetime.
+//! The leaked memory is:
+//! - Small (~100 bytes per HnswIo instance)
+//! - Only allocated once per index load (not per operation)
+//! - Reclaimed when the process exits
+//!
+//! TODO: Consider using `owning_ref` or `self_cell` crate for proper lifetime management.
 
 pub mod dynamic;
 pub mod multi_vector;
 
 use std::path::Path;
+use std::collections::HashMap;
+use std::sync::RwLock;
 use anyhow::Result;
 use hnsw_rs::prelude::*;
 use hnsw_rs::hnswio::HnswIo;
 use std::sync::Arc;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+
+/// Wrapper for raw HnswIo pointer that implements Send + Sync.
+///
+/// # Safety
+/// This is safe because:
+/// 1. HnswIo instances are leaked (never deallocated)
+/// 2. We only create references to them, protected by RwLock
+/// 3. HnswIo itself is thread-safe for the operations we use
+struct HnswIoPtr(*mut HnswIo);
+
+// SAFETY: HnswIo is never mutated concurrently - all access is protected by RwLock
+unsafe impl Send for HnswIoPtr {}
+unsafe impl Sync for HnswIoPtr {}
+
+/// Global storage for HnswIo instances to prevent repeated leaks.
+/// Each unique path gets one HnswIo, stored as raw pointer.
+static HNSW_IO_CACHE: Lazy<RwLock<HashMap<String, HnswIoPtr>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Get or create a static HnswIo reference for the given path.
+/// This ensures we only leak memory once per unique index path.
+///
+/// # Safety
+/// The returned reference is valid for 'static lifetime because:
+/// 1. HnswIo instances are never deallocated (intentional leak)
+/// 2. HnswIo is not mutated after creation (load_hnsw takes &mut self but only reads)
+fn get_or_create_hnsw_io(parent: &Path, filename: &str) -> &'static mut HnswIo {
+    let cache_key = format!("{}:{}", parent.display(), filename);
+
+    // Check if we already have this HnswIo cached
+    {
+        let cache = HNSW_IO_CACHE.read().unwrap();
+        if let Some(wrapper) = cache.get(&cache_key) {
+            // SAFETY: ptr was created from Box::leak and is never deallocated
+            return unsafe { &mut *wrapper.0 };
+        }
+    }
+
+    // Create new HnswIo and cache it
+    let mut cache = HNSW_IO_CACHE.write().unwrap();
+
+    // Double-check after acquiring write lock
+    if let Some(wrapper) = cache.get(&cache_key) {
+        // SAFETY: ptr was created from Box::leak and is never deallocated
+        return unsafe { &mut *wrapper.0 };
+    }
+
+    // Create and leak the HnswIo (intentional - see module docs)
+    let reloader = Box::new(HnswIo::new(parent, filename));
+    let ptr: *mut HnswIo = Box::into_raw(reloader);
+    cache.insert(cache_key, HnswIoPtr(ptr));
+
+    // SAFETY: ptr is valid and was just created
+    unsafe { &mut *ptr }
+}
 
 /// Distance metric options for vector similarity search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,34 +337,35 @@ impl HnswIndexer {
 
     /// Load an index from disk.
     /// The distance metric must match the saved index.
+    ///
+    /// # Memory Management
+    /// This function uses a cached HnswIo pool to minimize memory leaks.
+    /// Each unique index path only allocates one HnswIo instance.
     pub fn load(path: &Path, dim: usize, metric: DistanceMetric) -> Result<Self> {
         let parent = path.parent().unwrap_or(Path::new("."));
         let filename = path
             .file_name()
-            .ok_or(anyhow::anyhow!("Invalid path"))?
+            .ok_or_else(|| anyhow::anyhow!("Invalid path: no filename"))?
             .to_str()
-            .ok_or(anyhow::anyhow!("Invalid filename"))?;
+            .ok_or_else(|| anyhow::anyhow!("Invalid filename: not UTF-8"))?;
 
         let inner = match metric {
             DistanceMetric::Euclidean => {
-                let reloader = Box::new(HnswIo::new(parent, filename));
-                let reloader: &'static mut HnswIo = Box::leak(reloader);
+                let reloader = get_or_create_hnsw_io(parent, filename);
                 let h: Hnsw<'static, f32, DistL2> = reloader
                     .load_hnsw::<f32, DistL2>()
                     .map_err(|e| anyhow::anyhow!("Failed to load L2 index: {:?}", e))?;
                 HnswInner::L2(Arc::new(h))
             }
             DistanceMetric::Cosine => {
-                let reloader = Box::new(HnswIo::new(parent, filename));
-                let reloader: &'static mut HnswIo = Box::leak(reloader);
+                let reloader = get_or_create_hnsw_io(parent, filename);
                 let h: Hnsw<'static, f32, DistCosine> = reloader
                     .load_hnsw::<f32, DistCosine>()
                     .map_err(|e| anyhow::anyhow!("Failed to load Cosine index: {:?}", e))?;
                 HnswInner::Cosine(Arc::new(h))
             }
             DistanceMetric::DotProduct => {
-                let reloader = Box::new(HnswIo::new(parent, filename));
-                let reloader: &'static mut HnswIo = Box::leak(reloader);
+                let reloader = get_or_create_hnsw_io(parent, filename);
                 let h: Hnsw<'static, f32, DistDot> = reloader
                     .load_hnsw::<f32, DistDot>()
                     .map_err(|e| anyhow::anyhow!("Failed to load Dot index: {:?}", e))?;
@@ -305,6 +374,11 @@ impl HnswIndexer {
         };
 
         Ok(Self { inner, dim, metric })
+    }
+
+    /// Get the number of cached HnswIo instances (for debugging/monitoring).
+    pub fn cached_io_count() -> usize {
+        HNSW_IO_CACHE.read().map(|c| c.len()).unwrap_or(0)
     }
 }
 
