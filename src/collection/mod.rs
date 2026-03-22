@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::cache::{QueryCache, QueryCacheKey, FilterBitmapCache};
 use crate::index::{HnswIndexer, DistanceMetric};
+use crate::index::adaptive::{AdaptiveIndexer, AdaptiveIndexConfig, AdaptiveIndexStats, IndexType, DEFAULT_BRUTE_FORCE_THRESHOLD};
 use crate::index::prewarm::{prewarm_collection, PrewarmConfig};
 use crate::storage::{
     MemmapVectorStore, QuantizedMemmapVectorStore, SledMetadataStore,
@@ -45,6 +46,27 @@ pub struct CollectionConfig {
     /// WAL settings
     #[serde(default)]
     pub wal: WalConfigWrapper,
+    /// Adaptive index settings (brute-force vs HNSW based on size)
+    #[serde(default)]
+    pub adaptive: AdaptiveConfigWrapper,
+}
+
+/// Adaptive index configuration wrapper for Collection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveConfigWrapper {
+    /// Enable adaptive index selection (default: true)
+    pub enabled: bool,
+    /// Threshold for switching from brute-force to HNSW (default: 2000)
+    pub brute_force_threshold: usize,
+}
+
+impl Default for AdaptiveConfigWrapper {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            brute_force_threshold: DEFAULT_BRUTE_FORCE_THRESHOLD,
+        }
+    }
 }
 
 /// WAL configuration wrapper for Collection
@@ -131,6 +153,7 @@ impl Default for CollectionConfig {
                 text_fields: vec![],
             },
             wal: WalConfigWrapper::default(),
+            adaptive: AdaptiveConfigWrapper::default(),
         }
     }
 }
@@ -211,8 +234,10 @@ pub struct Collection {
     pub vector_store: Arc<dyn VectorStore>,
     /// Metadata storage
     pub metadata_store: Arc<dyn MetadataStore>,
-    /// HNSW index
+    /// HNSW index (used when adaptive is disabled or after threshold)
     pub indexer: Arc<HnswIndexer>,
+    /// Adaptive indexer (brute-force for small, HNSW for large)
+    adaptive_indexer: Option<AdaptiveIndexer>,
     /// BM25 text index for full-text search
     text_index: Option<TextIndex>,
     /// Base path for this collection
@@ -336,11 +361,32 @@ impl Collection {
         let query_cache = Some(Arc::new(QueryCache::new(1000, Duration::from_secs(60))));
         let filter_cache = Some(Arc::new(FilterBitmapCache::new(500)));
 
+        // Create adaptive indexer if enabled
+        let adaptive_indexer = if config.adaptive.enabled {
+            let adaptive_config = AdaptiveIndexConfig {
+                enabled: true,
+                brute_force_threshold: config.adaptive.brute_force_threshold,
+                distance_metric,
+                max_elements: config.hnsw.max_elements,
+                m: config.hnsw.m,
+                ef_construction: config.hnsw.ef_construction,
+            };
+            Some(AdaptiveIndexer::with_hnsw(
+                adaptive_config,
+                vector_store.clone(),
+                indexer.clone(),
+                dim,
+            ))
+        } else {
+            None
+        };
+
         let mut collection = Self {
             config,
             vector_store,
             metadata_store,
             indexer,
+            adaptive_indexer,
             text_index,
             base_path: base_path.to_path_buf(),
             deleted_ids: RwLock::new(deleted_ids),
@@ -737,6 +783,35 @@ impl Collection {
     /// Get filter cache statistics.
     pub fn filter_cache_stats(&self) -> Option<crate::cache::FilterCacheStats> {
         self.filter_cache.as_ref().map(|c| c.stats())
+    }
+
+    /// Check if adaptive indexing is enabled.
+    pub fn is_adaptive_enabled(&self) -> bool {
+        self.adaptive_indexer.is_some()
+    }
+
+    /// Get adaptive index statistics.
+    pub fn adaptive_index_stats(&self) -> Option<AdaptiveIndexStats> {
+        self.adaptive_indexer.as_ref().map(|ai| ai.stats())
+    }
+
+    /// Get current index type (BruteForce or Hnsw).
+    pub fn current_index_type(&self) -> Option<IndexType> {
+        self.adaptive_indexer.as_ref().map(|ai| ai.current_type())
+    }
+
+    /// Search using adaptive indexer if available, otherwise use HNSW directly.
+    pub fn adaptive_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&RoaringBitmap>,
+    ) -> Result<Vec<(u64, f32)>> {
+        if let Some(ref adaptive) = self.adaptive_indexer {
+            adaptive.search(query, k, filter)
+        } else {
+            self.indexer.search(query, k, filter)
+        }
     }
 
     /// Flush all data to disk with atomic writes.

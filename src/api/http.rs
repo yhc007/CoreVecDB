@@ -597,6 +597,7 @@ pub async fn collection_router_with_replication(
         .route("/collections/:name/checkpoint", post(collection_checkpoint))
         .route("/collections/:name/wal_stats", get(collection_wal_stats))
         .route("/collections/:name/cache_stats", get(collection_cache_stats))
+        .route("/collections/:name/index_stats", get(collection_index_stats))
         .route("/checkpoint_all", post(checkpoint_all))
         // Replication status
         .route("/replication/status", get(replication_status))
@@ -925,7 +926,7 @@ async fn collection_search(
         );
     }
 
-    let results = collection.indexer.search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())
+    let results = collection.adaptive_search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let include_meta = payload.include_metadata;
@@ -1273,8 +1274,8 @@ async fn collection_stream_search(
         );
     }
 
-    // Perform search
-    let results = collection.indexer.search(&payload.vector, k, filter_bitmap.as_ref())
+    // Perform search (using adaptive indexer)
+    let results = collection.adaptive_search(&payload.vector, k, filter_bitmap.as_ref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let total_results = results.len();
@@ -2257,6 +2258,47 @@ async fn collection_cache_stats(
     }))
 }
 
+/// Index statistics response.
+#[derive(Serialize)]
+pub struct IndexStatsResp {
+    collection: String,
+    adaptive_enabled: bool,
+    current_type: String,
+    vector_count: usize,
+    brute_force_threshold: usize,
+    hnsw_initialized: bool,
+}
+
+/// Get index statistics for a collection (including adaptive index info).
+async fn collection_index_stats(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<IndexStatsResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if let Some(stats) = collection.adaptive_index_stats() {
+        Ok(Json(IndexStatsResp {
+            collection: name,
+            adaptive_enabled: stats.adaptive_enabled,
+            current_type: format!("{:?}", stats.current_type),
+            vector_count: stats.vector_count,
+            brute_force_threshold: stats.brute_force_threshold,
+            hnsw_initialized: stats.hnsw_initialized,
+        }))
+    } else {
+        // Adaptive indexing not enabled - return HNSW stats
+        Ok(Json(IndexStatsResp {
+            collection: name,
+            adaptive_enabled: false,
+            current_type: "Hnsw".to_string(),
+            vector_count: collection.len(),
+            brute_force_threshold: 0,
+            hnsw_initialized: true,
+        }))
+    }
+}
+
 /// Checkpoint all response.
 #[derive(Serialize)]
 pub struct CheckpointAllResp {
@@ -2514,7 +2556,7 @@ async fn legacy_search(
         );
     }
 
-    let results = collection.indexer.search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())
+    let results = collection.adaptive_search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let include_meta = payload.include_metadata;
