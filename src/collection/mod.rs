@@ -15,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::cache::{QueryCache, QueryCacheKey, FilterBitmapCache};
 use crate::index::{HnswIndexer, DistanceMetric};
 use crate::storage::{
     MemmapVectorStore, QuantizedMemmapVectorStore, SledMetadataStore,
@@ -23,6 +24,7 @@ use crate::storage::{
 use crate::text::{TextIndex, TextSearchResult, HybridSearchResult, hybrid_combine, rrf_combine};
 use crate::wal::{WriteAheadLog, WalConfig, WalOperation, WalStats};
 use roaring::RoaringBitmap;
+use std::time::Duration;
 
 /// Collection configuration stored on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +223,10 @@ pub struct Collection {
     /// Cached active bitmap (complement of deleted_ids)
     /// Invalidated when vectors are added or deleted
     cached_active_bitmap: RwLock<Option<CachedActiveBitmap>>,
+    /// Query result cache for repeated searches
+    query_cache: Option<Arc<QueryCache>>,
+    /// Filter bitmap cache for repeated filters
+    filter_cache: Option<Arc<FilterBitmapCache>>,
 }
 
 /// Cached active bitmap with version tracking
@@ -324,6 +330,11 @@ impl Collection {
             None
         };
 
+        // Initialize caches with default settings
+        // TODO: Make cache settings configurable via CollectionConfig
+        let query_cache = Some(Arc::new(QueryCache::new(1000, Duration::from_secs(60))));
+        let filter_cache = Some(Arc::new(FilterBitmapCache::new(500)));
+
         let mut collection = Self {
             config,
             vector_store,
@@ -334,6 +345,8 @@ impl Collection {
             deleted_ids: RwLock::new(deleted_ids),
             wal,
             cached_active_bitmap: RwLock::new(None), // Will be computed on first use
+            query_cache,
+            filter_cache,
         };
 
         // Perform WAL recovery if needed
@@ -472,6 +485,9 @@ impl Collection {
         // Check if checkpoint is needed
         self.maybe_checkpoint()?;
 
+        // Invalidate query cache (new vector may affect search results)
+        self.invalidate_query_cache();
+
         Ok(id)
     }
 
@@ -527,6 +543,9 @@ impl Collection {
         // Check if checkpoint is needed
         self.maybe_checkpoint()?;
 
+        // Invalidate query cache (new vectors may affect search results)
+        self.invalidate_query_cache();
+
         Ok(start_id)
     }
 
@@ -552,8 +571,9 @@ impl Collection {
         deleted.insert(id as u32);
         drop(deleted); // Release lock before invalidating cache
 
-        // Invalidate active bitmap cache
+        // Invalidate caches
         self.invalidate_active_cache();
+        self.invalidate_query_cache();
 
         // Remove from text index
         if let Some(ref text_index) = self.text_index {
@@ -594,8 +614,9 @@ impl Collection {
         }
         drop(deleted); // Release lock before invalidating cache
 
-        // Invalidate active bitmap cache
+        // Invalidate caches
         self.invalidate_active_cache();
+        self.invalidate_query_cache();
 
         Ok(valid_ids.len())
     }
@@ -665,6 +686,42 @@ impl Collection {
     fn invalidate_active_cache(&self) {
         let mut cache = self.cached_active_bitmap.write();
         *cache = None;
+    }
+
+    /// Invalidate query result cache.
+    /// Called when vectors are inserted or deleted.
+    fn invalidate_query_cache(&self) {
+        if let Some(ref cache) = self.query_cache {
+            cache.invalidate_collection(&self.config.name);
+        }
+    }
+
+    /// Invalidate filter bitmap cache for a specific field.
+    /// Called when metadata for that field is updated.
+    pub fn invalidate_filter_cache_field(&self, field: &str) {
+        if let Some(ref cache) = self.filter_cache {
+            cache.invalidate_field(field);
+        }
+    }
+
+    /// Get query cache reference for search operations.
+    pub fn query_cache(&self) -> Option<&Arc<QueryCache>> {
+        self.query_cache.as_ref()
+    }
+
+    /// Get filter bitmap cache reference.
+    pub fn filter_cache(&self) -> Option<&Arc<FilterBitmapCache>> {
+        self.filter_cache.as_ref()
+    }
+
+    /// Get query cache statistics.
+    pub fn query_cache_stats(&self) -> Option<crate::cache::QueryCacheStats> {
+        self.query_cache.as_ref().map(|c| c.stats())
+    }
+
+    /// Get filter cache statistics.
+    pub fn filter_cache_stats(&self) -> Option<crate::cache::FilterCacheStats> {
+        self.filter_cache.as_ref().map(|c| c.stats())
     }
 
     /// Flush all data to disk with atomic writes.

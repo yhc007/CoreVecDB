@@ -23,8 +23,11 @@
 //!
 //! TODO: Consider using `owning_ref` or `self_cell` crate for proper lifetime management.
 
+pub mod adaptive;
 pub mod dynamic;
+pub mod layer_cache;
 pub mod multi_vector;
+pub mod prewarm;
 
 use std::path::Path;
 use std::collections::HashMap;

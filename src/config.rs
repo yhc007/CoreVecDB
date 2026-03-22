@@ -7,6 +7,21 @@ pub struct AppConfig {
     pub index: IndexConfig,
     pub quantization: QuantizationConfig,
     pub payload: PayloadConfig,
+    pub cache: CacheConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CacheConfig {
+    /// Enable query result caching
+    pub query_cache_enabled: bool,
+    /// Maximum number of cached query results
+    pub query_cache_size: usize,
+    /// TTL for cached query results in seconds
+    pub query_cache_ttl_seconds: u64,
+    /// Enable filter bitmap caching
+    pub filter_cache_enabled: bool,
+    /// Maximum number of cached filter bitmaps
+    pub filter_cache_size: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -61,6 +76,11 @@ impl AppConfig {
             .set_default("payload.index_enabled", true)?
             .set_default::<&str, Vec<String>>("payload.indexed_fields", vec![])?
             .set_default::<&str, Vec<String>>("payload.numeric_fields", vec![])?
+            .set_default("cache.query_cache_enabled", true)?
+            .set_default("cache.query_cache_size", 1000)?
+            .set_default("cache.query_cache_ttl_seconds", 60)?
+            .set_default("cache.filter_cache_enabled", true)?
+            .set_default("cache.filter_cache_size", 500)?
             // Load from config file (optional)
             .add_source(File::with_name("config").required(false))
             // Load from environment variables (e.g. APP_SERVER__GRPC_PORT=50052)

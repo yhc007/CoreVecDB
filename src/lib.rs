@@ -1,4 +1,5 @@
 pub mod api;
+pub mod cache;
 pub mod collection;
 pub mod config;
 pub mod diskann;
@@ -11,6 +12,7 @@ pub mod navix;
 pub mod payload;
 pub mod proto;
 pub mod quantization;
+pub mod query;
 pub mod rabitq;
 pub mod replication;
 pub mod sharding;

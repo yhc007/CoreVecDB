@@ -14,6 +14,10 @@ use crate::quantization::{ScalarQuantizer, QuantizerStats};
 use crate::payload::{PayloadIndex, FilterQuery, PayloadIndexFullStats};
 use roaring::RoaringBitmap;
 
+pub mod tiered;
+pub mod compression;
+pub mod segmented;
+
 /// Zero-copy reference to vector data from mmap.
 /// Avoids heap allocation and memory copy for read operations.
 pub enum VectorRef<'a> {
