@@ -4,4 +4,4 @@
 
 pub mod planner;
 
-pub use planner::{QueryPlanner, FieldStatistics, FilterPlan, FilterOrder};
+pub use planner::{QueryPlanner, FieldStatistics, FilterPlan, FilterOrder, FilterStrategy};

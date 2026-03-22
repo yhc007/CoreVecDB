@@ -835,10 +835,15 @@ async fn collection_search(
     // 1. String field filters (exact match) - with filter cache
     let has_metadata_filter = !payload.filter.is_empty();
     let used_index_filter = if has_metadata_filter {
-        let conditions: Vec<(&str, &str)> = payload
-            .filter
+        // Use query planner to optimize filter order (most selective first)
+        let filter_plan = collection.plan_filters(
+            payload.filter.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        );
+
+        // Build conditions in optimized order
+        let conditions: Vec<(&str, &str)> = filter_plan.filters
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .map(|f| (f.field.as_str(), f.value.as_str()))
             .collect();
 
         // Try filter cache first

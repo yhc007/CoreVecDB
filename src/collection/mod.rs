@@ -19,6 +19,7 @@ use crate::cache::{QueryCache, QueryCacheKey, FilterBitmapCache};
 use crate::index::{HnswIndexer, DistanceMetric};
 use crate::index::adaptive::{AdaptiveIndexer, AdaptiveIndexConfig, AdaptiveIndexStats, IndexType, DEFAULT_BRUTE_FORCE_THRESHOLD};
 use crate::index::prewarm::{prewarm_collection, PrewarmConfig};
+use crate::query::{QueryPlanner, FilterOrder, FilterPlan, FilterStrategy};
 use crate::storage::{
     MemmapVectorStore, QuantizedMemmapVectorStore, SledMetadataStore,
     IndexedSledMetadataStore, VectorStore, MetadataStore, MetadataEntry,
@@ -253,6 +254,8 @@ pub struct Collection {
     query_cache: Option<Arc<QueryCache>>,
     /// Filter bitmap cache for repeated filters
     filter_cache: Option<Arc<FilterBitmapCache>>,
+    /// Query planner for filter optimization
+    query_planner: QueryPlanner,
 }
 
 /// Cached active bitmap with version tracking
@@ -381,6 +384,9 @@ impl Collection {
             None
         };
 
+        // Create query planner for filter optimization
+        let query_planner = QueryPlanner::new();
+
         let mut collection = Self {
             config,
             vector_store,
@@ -394,6 +400,7 @@ impl Collection {
             cached_active_bitmap: RwLock::new(None), // Will be computed on first use
             query_cache,
             filter_cache,
+            query_planner,
         };
 
         // Perform WAL recovery if needed
@@ -538,6 +545,10 @@ impl Collection {
             self.metadata_store.insert(id, key.clone(), value.clone())?;
         }
 
+        // Update query planner statistics
+        let meta_map: std::collections::HashMap<String, String> = metadata.iter().cloned().collect();
+        self.query_planner.observe_fields(&meta_map);
+
         // Index text for BM25 search
         if let Some(ref text_index) = self.text_index {
             text_index.index_document(id, metadata)?;
@@ -583,12 +594,15 @@ impl Collection {
             .collect();
         self.indexer.insert_batch(&vectors_with_ids)?;
 
-        // Insert metadata
+        // Insert metadata and update query planner statistics
         for (i, meta) in metadata.iter().enumerate() {
             let id = start_id + i as u64;
             for (key, value) in meta {
                 self.metadata_store.insert(id, key.clone(), value.clone())?;
             }
+            // Update query planner statistics
+            let meta_map: std::collections::HashMap<String, String> = meta.iter().cloned().collect();
+            self.query_planner.observe_fields(&meta_map);
         }
 
         // Index text for BM25 search
@@ -812,6 +826,26 @@ impl Collection {
         } else {
             self.indexer.search(query, k, filter)
         }
+    }
+
+    /// Get query planner reference.
+    pub fn query_planner(&self) -> &QueryPlanner {
+        &self.query_planner
+    }
+
+    /// Plan filters for optimal execution order.
+    /// Returns filters sorted by selectivity (most selective first).
+    pub fn plan_filters(&self, filters: Vec<(&str, &str)>) -> FilterPlan {
+        let filter_orders: Vec<FilterOrder> = filters
+            .into_iter()
+            .map(|(field, value)| FilterOrder::new(field, value))
+            .collect();
+        self.query_planner.plan_filters(filter_orders)
+    }
+
+    /// Estimate selectivity for a filter condition.
+    pub fn estimate_filter_selectivity(&self, field: &str, value: &str) -> f32 {
+        self.query_planner.estimate_selectivity(field, value)
     }
 
     /// Flush all data to disk with atomic writes.
