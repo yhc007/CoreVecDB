@@ -113,6 +113,8 @@ Client → HTTP (port 3000) or gRPC (port 50051)
 - `index.dim` (vector dimension), `index.max_elements`, `index.m`, `index.ef_construction`
 - `quantization.enabled`, `quantization.keep_originals`, `quantization.rerank_oversample`
 - `payload.index_enabled`, `payload.indexed_fields`, `payload.numeric_fields`
+- `cache.query_cache_enabled`, `cache.query_cache_size`, `cache.query_cache_ttl_seconds`
+- `cache.filter_cache_enabled`, `cache.filter_cache_size`
 
 Environment override: `APP_SERVER__GRPC_PORT=50052` etc.
 
@@ -171,6 +173,10 @@ Environment override: `APP_SERVER__GRPC_PORT=50052` etc.
 - `POST /collections/:name/versioned/vectors/:id/rollback` - Rollback to version
 - `POST /collections/:name/versioned/snapshot` - Get snapshot at timestamp
 - `GET /collections/:name/versioned/stats` - Get versioning statistics
+
+### Cache & Index Stats
+- `GET /collections/:name/cache_stats` - Get query and filter cache statistics
+- `GET /collections/:name/index_stats` - Get adaptive index statistics
 
 ### System Info
 - `GET /simd` - Get SIMD capability information
@@ -2822,6 +2828,21 @@ clamped to max_expansion
 | 10 | 1,697 | 5.69ms |
 | 20 | 2,293 | 8.57ms |
 | 50 | 2,055 | 22.37ms |
+
+### Cache Performance
+
+| Scenario | QPS | Avg Latency | Improvement |
+|----------|-----|-------------|-------------|
+| Cold (cache miss) | 250 | 4.01ms | - |
+| Warm (cache hit) | 1,196 | 0.84ms | **~5x** |
+
+### Filter Optimization
+
+| Filter Type | QPS | Avg Latency | vs No Filter |
+|-------------|-----|-------------|--------------|
+| No filter | 115 | 8.74ms | - |
+| Indexed filter | 637 | 1.57ms | **5.6x** |
+| Multi indexed | 915 | 1.09ms | **8x** |
 
 ### Index Comparison
 
