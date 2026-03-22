@@ -321,13 +321,8 @@ impl VectorService for VectorServiceImpl {
             );
         }
 
-        // 4. Exclude deleted vectors
-        let deleted_bitmap = collection.deleted_bitmap();
-        if !deleted_bitmap.is_empty() {
-            let total = collection.len() as u64;
-            let mut universe = RoaringBitmap::new();
-            universe.insert_range(0..total as u32);
-            let active_bitmap = &universe - &deleted_bitmap;
+        // 4. Exclude deleted vectors (using cached active bitmap)
+        if let Some(active_bitmap) = collection.active_bitmap() {
             filter_bitmap = Some(
                 filter_bitmap
                     .map(|existing| existing & &active_bitmap)
@@ -1000,13 +995,8 @@ impl VectorService for VectorServiceImpl {
             );
         }
 
-        // 4. Exclude deleted vectors
-        let deleted_bitmap = collection.deleted_bitmap();
-        if !deleted_bitmap.is_empty() {
-            let total = collection.len() as u64;
-            let mut universe = RoaringBitmap::new();
-            universe.insert_range(0..total as u32);
-            let active_bitmap = &universe - &deleted_bitmap;
+        // 4. Exclude deleted vectors (using cached active bitmap)
+        if let Some(active_bitmap) = collection.active_bitmap() {
             filter_bitmap = Some(
                 filter_bitmap
                     .map(|existing| existing & &active_bitmap)

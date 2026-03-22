@@ -218,6 +218,19 @@ pub struct Collection {
     deleted_ids: RwLock<RoaringBitmap>,
     /// Write-Ahead Log for crash recovery
     wal: Option<WriteAheadLog>,
+    /// Cached active bitmap (complement of deleted_ids)
+    /// Invalidated when vectors are added or deleted
+    cached_active_bitmap: RwLock<Option<CachedActiveBitmap>>,
+}
+
+/// Cached active bitmap with version tracking
+struct CachedActiveBitmap {
+    /// The active (non-deleted) vector IDs
+    bitmap: RoaringBitmap,
+    /// Total vector count when this cache was created
+    vector_count: usize,
+    /// Deleted count when this cache was created
+    deleted_count: u64,
 }
 
 impl Collection {
@@ -320,6 +333,7 @@ impl Collection {
             base_path: base_path.to_path_buf(),
             deleted_ids: RwLock::new(deleted_ids),
             wal,
+            cached_active_bitmap: RwLock::new(None), // Will be computed on first use
         };
 
         // Perform WAL recovery if needed
@@ -536,6 +550,10 @@ impl Collection {
         }
 
         deleted.insert(id as u32);
+        drop(deleted); // Release lock before invalidating cache
+
+        // Invalidate active bitmap cache
+        self.invalidate_active_cache();
 
         // Remove from text index
         if let Some(ref text_index) = self.text_index {
@@ -574,6 +592,10 @@ impl Collection {
         for id in &valid_ids {
             deleted.insert(*id as u32);
         }
+        drop(deleted); // Release lock before invalidating cache
+
+        // Invalidate active bitmap cache
+        self.invalidate_active_cache();
 
         Ok(valid_ids.len())
     }
@@ -581,6 +603,68 @@ impl Collection {
     /// Get the deleted IDs bitmap for search filtering.
     pub fn deleted_bitmap(&self) -> RoaringBitmap {
         self.deleted_ids.read().clone()
+    }
+
+    /// Get the active (non-deleted) vector IDs bitmap.
+    /// Uses caching to avoid O(n) computation on every search.
+    ///
+    /// Returns None if there are no deleted vectors (no filtering needed).
+    pub fn active_bitmap(&self) -> Option<RoaringBitmap> {
+        let deleted = self.deleted_ids.read();
+        if deleted.is_empty() {
+            return None; // No filtering needed
+        }
+
+        let total = self.vector_store.len();
+        let deleted_count = deleted.len();
+
+        // Check if cache is still valid
+        {
+            let cache = self.cached_active_bitmap.read();
+            if let Some(ref cached) = *cache {
+                if cached.vector_count == total && cached.deleted_count == deleted_count {
+                    return Some(cached.bitmap.clone());
+                }
+            }
+        }
+
+        // Cache miss or invalid - recompute
+        // Drop the deleted read lock before acquiring write lock
+        drop(deleted);
+
+        let mut cache = self.cached_active_bitmap.write();
+
+        // Double-check after acquiring write lock
+        let deleted = self.deleted_ids.read();
+        let total = self.vector_store.len();
+        let deleted_count = deleted.len();
+
+        if let Some(ref cached) = *cache {
+            if cached.vector_count == total && cached.deleted_count == deleted_count {
+                return Some(cached.bitmap.clone());
+            }
+        }
+
+        // Compute active bitmap
+        let mut universe = RoaringBitmap::new();
+        universe.insert_range(0..total as u32);
+        let active = &universe - &*deleted;
+
+        // Store in cache
+        *cache = Some(CachedActiveBitmap {
+            bitmap: active.clone(),
+            vector_count: total,
+            deleted_count,
+        });
+
+        Some(active)
+    }
+
+    /// Invalidate the active bitmap cache.
+    /// Called when vectors are inserted or deleted.
+    fn invalidate_active_cache(&self) {
+        let mut cache = self.cached_active_bitmap.write();
+        *cache = None;
     }
 
     /// Flush all data to disk with atomic writes.
