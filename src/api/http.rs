@@ -13,6 +13,7 @@ use crate::storage::{MetadataEntry, IndexedMetadata};
 use crate::payload::FilterQuery;
 use crate::replication::{ReplicationManager, ReplicationRole};
 use crate::metrics;
+use crate::cache::{QueryCacheKey, FilterBitmapCache};
 use serde::{Deserialize, Serialize};
 
 // Wrapper structs for JSON compatibility if proto structs don't behave well with Serde automatically
@@ -595,6 +596,7 @@ pub async fn collection_router_with_replication(
         .route("/collections/:name/compact", post(collection_compact))
         .route("/collections/:name/checkpoint", post(collection_checkpoint))
         .route("/collections/:name/wal_stats", get(collection_wal_stats))
+        .route("/collections/:name/cache_stats", get(collection_cache_stats))
         .route("/checkpoint_all", post(checkpoint_all))
         // Replication status
         .route("/replication/status", get(replication_status))
@@ -791,10 +793,45 @@ async fn collection_search(
     let collection = state.manager.get(&name)
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    // Check query cache first (if no metadata post-filtering needed)
+    let cache_key = QueryCacheKey::new(
+        &name,
+        &payload.vector,
+        payload.k as usize,
+        Some(&payload.filter),
+    );
+    let current_vector_count = collection.len();
+
+    // Only use cache if no range filters, filter_ids, or filter_id_range (complex filters)
+    let use_cache = payload.range_filters.is_empty()
+        && payload.filter_ids.is_none()
+        && payload.filter_id_range.is_none();
+
+    if use_cache {
+        if let Some(ref query_cache) = collection.query_cache() {
+            if let Some(cached_results) = query_cache.get(&cache_key, current_vector_count) {
+                // Cache hit - return cached results
+                let include_meta = payload.include_metadata;
+                let final_results: Vec<JsonSearchResult> = cached_results
+                    .into_iter()
+                    .map(|(id, score)| {
+                        let metadata = if include_meta {
+                            Some(collection.metadata_store.get_all(id))
+                        } else {
+                            None
+                        };
+                        JsonSearchResult { id, score, metadata }
+                    })
+                    .collect();
+                return Ok(Json(JsonSearchResp { results: final_results }));
+            }
+        }
+    }
+
     // Build filter bitmap
     let mut filter_bitmap: Option<roaring::RoaringBitmap> = None;
 
-    // 1. String field filters (exact match)
+    // 1. String field filters (exact match) - with filter cache
     let has_metadata_filter = !payload.filter.is_empty();
     let used_index_filter = if has_metadata_filter {
         let conditions: Vec<(&str, &str)> = payload
@@ -803,7 +840,22 @@ async fn collection_search(
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        if let Some(indexed_bitmap) = collection.metadata_store.try_filter_and(&conditions) {
+        // Try filter cache first
+        let filter_cache_key = FilterBitmapCache::normalize_key(&conditions);
+
+        if let Some(ref filter_cache) = collection.filter_cache() {
+            if let Some(cached_bitmap) = filter_cache.get(&filter_cache_key) {
+                filter_bitmap = Some(cached_bitmap);
+                true
+            } else if let Some(indexed_bitmap) = collection.metadata_store.try_filter_and(&conditions) {
+                // Cache the computed bitmap
+                filter_cache.put(filter_cache_key, indexed_bitmap.clone());
+                filter_bitmap = Some(indexed_bitmap);
+                true
+            } else {
+                false
+            }
+        } else if let Some(indexed_bitmap) = collection.metadata_store.try_filter_and(&conditions) {
             filter_bitmap = Some(indexed_bitmap);
             true
         } else {
@@ -879,6 +931,7 @@ async fn collection_search(
     let include_meta = payload.include_metadata;
 
     let final_results: Vec<JsonSearchResult> = if has_metadata_filter && !used_index_filter {
+        // Post-filter: can't cache since results depend on runtime filtering
         results
             .into_iter()
             .filter(|(id, _)| {
@@ -902,6 +955,13 @@ async fn collection_search(
             })
             .collect()
     } else {
+        // Store results in query cache (only for simple queries without post-filtering)
+        if use_cache {
+            if let Some(ref query_cache) = collection.query_cache() {
+                query_cache.put(cache_key, results.clone(), current_vector_count);
+            }
+        }
+
         results
             .into_iter()
             .map(|(id, score)| {
@@ -2131,6 +2191,69 @@ async fn collection_wal_stats(
         last_checkpoint: wal_stats.as_ref().map(|s| s.last_checkpoint),
         entries_since_checkpoint: wal_stats.as_ref().map(|s| s.entries_since_checkpoint),
         file_size: wal_stats.map(|s| s.file_size),
+    }))
+}
+
+/// Cache statistics response.
+#[derive(Serialize)]
+pub struct CacheStatsResp {
+    collection: String,
+    query_cache: Option<QueryCacheStatsResp>,
+    filter_cache: Option<FilterCacheStatsResp>,
+}
+
+/// Query cache statistics.
+#[derive(Serialize)]
+pub struct QueryCacheStatsResp {
+    size: usize,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+    invalidations: u64,
+    hit_rate: f64,
+}
+
+/// Filter cache statistics.
+#[derive(Serialize)]
+pub struct FilterCacheStatsResp {
+    size: usize,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+    invalidations: u64,
+    hit_rate: f64,
+}
+
+/// Get cache statistics for a collection.
+async fn collection_cache_stats(
+    State(state): State<Arc<CollectionAppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<CacheStatsResp>, StatusCode> {
+    let collection = state.manager.get(&name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let query_cache = collection.query_cache_stats().map(|s| QueryCacheStatsResp {
+        size: s.size,
+        capacity: s.capacity,
+        hits: s.hits,
+        misses: s.misses,
+        invalidations: s.invalidations,
+        hit_rate: s.hit_rate(),
+    });
+
+    let filter_cache = collection.filter_cache_stats().map(|s| FilterCacheStatsResp {
+        size: s.size,
+        capacity: s.capacity,
+        hits: s.hits,
+        misses: s.misses,
+        invalidations: s.invalidations,
+        hit_rate: s.hit_rate(),
+    });
+
+    Ok(Json(CacheStatsResp {
+        collection: name,
+        query_cache,
+        filter_cache,
     }))
 }
 

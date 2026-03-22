@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::cache::{QueryCache, QueryCacheKey, FilterBitmapCache};
 use crate::index::{HnswIndexer, DistanceMetric};
+use crate::index::prewarm::{prewarm_collection, PrewarmConfig};
 use crate::storage::{
     MemmapVectorStore, QuantizedMemmapVectorStore, SledMetadataStore,
     IndexedSledMetadataStore, VectorStore, MetadataStore, MetadataEntry,
@@ -351,6 +352,20 @@ impl Collection {
 
         // Perform WAL recovery if needed
         collection.recover_from_wal()?;
+
+        // Pre-warm index files into OS page cache
+        let prewarm_config = PrewarmConfig::default();
+        if let Ok(stats) = prewarm_collection(&collection.base_path, &prewarm_config) {
+            if stats.pages_loaded > 0 {
+                tracing::info!(
+                    "Pre-warmed collection '{}': {} pages ({:.1} MB) in {}ms",
+                    collection.config.name,
+                    stats.pages_loaded,
+                    stats.bytes_loaded as f64 / (1024.0 * 1024.0),
+                    stats.duration_ms
+                );
+            }
+        }
 
         Ok(collection)
     }
