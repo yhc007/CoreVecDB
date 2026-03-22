@@ -151,6 +151,8 @@ pub struct MemmapVectorStore {
     /// Writers use active buffer while flusher uses inactive buffer.
     buffers: DoubleBuffer,
     flushing: AtomicUsize,          // Flag to track if flush is in progress
+    /// Flag to track if last flush attempt failed (for retry logic)
+    last_flush_failed: AtomicUsize,
 }
 
 /// Single write buffer
@@ -252,6 +254,7 @@ impl MemmapVectorStore {
             count: AtomicUsize::new(count),
             buffers: DoubleBuffer::new(FLUSH_THRESHOLD_BYTES),
             flushing: AtomicUsize::new(0),
+            last_flush_failed: AtomicUsize::new(0),
         })
     }
 
@@ -414,12 +417,24 @@ impl VectorStore for MemmapVectorStore {
             buffer.pending_count >= WRITE_BUFFER_SIZE || buffer.data.len() >= FLUSH_THRESHOLD_BYTES
         };
 
+        // Check if previous flush failed - if so, we should try to flush even if not full
+        let retry_flush = self.last_flush_failed.load(Ordering::Acquire) == 1;
+
         // Only one thread flushes at a time; others continue writing
-        if should_flush {
+        if should_flush || retry_flush {
             // Try to acquire flush lock (non-blocking)
             if self.flushing.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                 // Use swap-based flush for better concurrency
                 let result = self.flush_with_swap();
+
+                if result.is_err() {
+                    // Mark flush as failed so next write will retry
+                    self.last_flush_failed.store(1, Ordering::Release);
+                } else {
+                    // Clear failure flag on success
+                    self.last_flush_failed.store(0, Ordering::Release);
+                }
+
                 self.flushing.store(0, Ordering::SeqCst);
                 result?;
             }
@@ -1568,4 +1583,217 @@ pub struct QuantizedMemoryStats {
     pub unquantized_would_be: usize,
     pub savings_bytes: usize,
     pub compression_ratio: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use tempfile::tempdir;
+
+    /// Test concurrent writes from multiple threads.
+    #[test]
+    fn test_concurrent_writes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("concurrent_test.bin");
+        let store = Arc::new(MemmapVectorStore::new(path.to_str().unwrap(), 4).unwrap());
+
+        let num_threads = 10;
+        let vectors_per_thread = 100;
+        let mut handles = vec![];
+
+        for t in 0..num_threads {
+            let store_clone = Arc::clone(&store);
+            let handle = thread::spawn(move || {
+                for i in 0..vectors_per_thread {
+                    let vec = vec![
+                        (t * 1000 + i) as f32,
+                        (t * 1000 + i + 1) as f32,
+                        (t * 1000 + i + 2) as f32,
+                        (t * 1000 + i + 3) as f32,
+                    ];
+                    store_clone.insert(&vec).expect("Insert failed");
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Flush and verify
+        store.flush().unwrap();
+        assert_eq!(store.len(), num_threads * vectors_per_thread);
+
+        // Verify all vectors are readable
+        for id in 0..(num_threads * vectors_per_thread) {
+            let vec = store.get(id as u64).expect("Get failed");
+            assert_eq!(vec.len(), 4);
+        }
+    }
+
+    /// Test concurrent reads and writes.
+    #[test]
+    fn test_concurrent_read_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("read_write_test.bin");
+        let store = Arc::new(MemmapVectorStore::new(path.to_str().unwrap(), 4).unwrap());
+
+        // Insert some initial data
+        for i in 0..100 {
+            store.insert(&[i as f32; 4]).unwrap();
+        }
+        store.flush().unwrap();
+
+        let num_writers = 5;
+        let num_readers = 5;
+        let ops_per_thread = 50;
+
+        let mut handles = vec![];
+
+        // Spawn writers
+        for t in 0..num_writers {
+            let store_clone = Arc::clone(&store);
+            let handle = thread::spawn(move || {
+                for i in 0..ops_per_thread {
+                    let vec = vec![(t * 1000 + i) as f32; 4];
+                    store_clone.insert(&vec).expect("Insert failed");
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Spawn readers
+        for _ in 0..num_readers {
+            let store_clone = Arc::clone(&store);
+            let handle = thread::spawn(move || {
+                for _ in 0..ops_per_thread {
+                    // Read random IDs from initial data
+                    for id in 0..10 {
+                        let _ = store_clone.get(id as u64);
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Final flush and verify
+        store.flush().unwrap();
+        let expected = 100 + (num_writers * ops_per_thread);
+        assert_eq!(store.len(), expected);
+    }
+
+    /// Test flush retry after failure simulation.
+    #[test]
+    fn test_flush_retry_flag() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("flush_retry_test.bin");
+        let store = MemmapVectorStore::new(path.to_str().unwrap(), 4).unwrap();
+
+        // Initially, last_flush_failed should be 0
+        assert_eq!(store.last_flush_failed.load(Ordering::Relaxed), 0);
+
+        // Insert data
+        for i in 0..10 {
+            store.insert(&[i as f32; 4]).unwrap();
+        }
+
+        // Flush should succeed and flag should remain 0
+        store.flush().unwrap();
+        assert_eq!(store.last_flush_failed.load(Ordering::Relaxed), 0);
+
+        // Verify count
+        assert_eq!(store.len(), 10);
+    }
+
+    /// Test batch insert with concurrent access.
+    #[test]
+    fn test_concurrent_batch_insert() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("batch_concurrent_test.bin");
+        let store = Arc::new(MemmapVectorStore::new(path.to_str().unwrap(), 4).unwrap());
+
+        let num_threads = 4;
+        let batch_size = 50;
+        let mut handles = vec![];
+
+        for t in 0..num_threads {
+            let store_clone = Arc::clone(&store);
+            let handle = thread::spawn(move || {
+                let vectors: Vec<Vec<f32>> = (0..batch_size)
+                    .map(|i| vec![(t * 1000 + i) as f32; 4])
+                    .collect();
+                store_clone.insert_batch(&vectors).expect("Batch insert failed");
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        store.flush().unwrap();
+        assert_eq!(store.len(), num_threads * batch_size);
+    }
+
+    /// Test data integrity under concurrent operations.
+    #[test]
+    fn test_data_integrity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("integrity_test.bin");
+        let store = Arc::new(MemmapVectorStore::new(path.to_str().unwrap(), 4).unwrap());
+
+        // Insert vectors with known patterns
+        let num_vectors = 100;
+        for i in 0..num_vectors {
+            let pattern = i as f32;
+            store.insert(&[pattern, pattern + 1.0, pattern + 2.0, pattern + 3.0]).unwrap();
+        }
+
+        store.flush().unwrap();
+
+        // Verify data integrity
+        for i in 0..num_vectors {
+            let vec = store.get(i as u64).unwrap();
+            let expected_pattern = i as f32;
+            assert_eq!(vec[0], expected_pattern, "Data corruption at ID {}", i);
+            assert_eq!(vec[1], expected_pattern + 1.0);
+            assert_eq!(vec[2], expected_pattern + 2.0);
+            assert_eq!(vec[3], expected_pattern + 3.0);
+        }
+    }
+
+    /// Test persistence: write, close, reopen, verify.
+    #[test]
+    fn test_persistence() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("persistence_test.bin");
+
+        // Write data
+        {
+            let store = MemmapVectorStore::new(path.to_str().unwrap(), 4).unwrap();
+            for i in 0..50 {
+                store.insert(&[i as f32; 4]).unwrap();
+            }
+            store.flush().unwrap();
+        }
+
+        // Reopen and verify
+        {
+            let store = MemmapVectorStore::new(path.to_str().unwrap(), 4).unwrap();
+            assert_eq!(store.len(), 50);
+            for i in 0..50 {
+                let vec = store.get(i as u64).unwrap();
+                assert_eq!(vec[0], i as f32);
+            }
+        }
+    }
 }

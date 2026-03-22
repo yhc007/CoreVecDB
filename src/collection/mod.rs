@@ -583,20 +583,35 @@ impl Collection {
         self.deleted_ids.read().clone()
     }
 
-    /// Flush all data to disk.
+    /// Flush all data to disk with atomic writes.
+    ///
+    /// Uses write-to-temp-then-rename pattern for atomic deleted bitmap updates.
+    /// This prevents data corruption if the process crashes mid-write.
     pub fn flush(&self) -> Result<()> {
         self.vector_store.flush()?;
 
-        // Save deleted IDs
+        // Save deleted IDs atomically using temp file + rename
         let deleted_path = self.base_path.join("deleted.bin");
+        let deleted_tmp_path = self.base_path.join("deleted.bin.tmp");
         let deleted = self.deleted_ids.read();
+
         if !deleted.is_empty() {
             let mut bytes = Vec::new();
             deleted.serialize_into(&mut bytes)?;
-            fs::write(deleted_path, bytes)?;
+
+            // Write to temp file first
+            fs::write(&deleted_tmp_path, &bytes)?;
+
+            // Atomic rename (POSIX guarantees atomicity for rename on same filesystem)
+            fs::rename(&deleted_tmp_path, &deleted_path)?;
         } else if deleted_path.exists() {
             // Remove file if no deleted IDs
-            let _ = fs::remove_file(deleted_path);
+            let _ = fs::remove_file(&deleted_path);
+        }
+
+        // Cleanup temp file if it exists (from previous failed attempt)
+        if deleted_tmp_path.exists() {
+            let _ = fs::remove_file(&deleted_tmp_path);
         }
 
         // Save text index
