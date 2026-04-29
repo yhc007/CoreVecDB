@@ -624,10 +624,7 @@ impl ShardedCollection {
                         Some(combined)
                     }
                     None if !deleted.is_empty() => {
-                        let total = collection.len() as u64;
-                        let mut universe = roaring::RoaringBitmap::new();
-                        universe.insert_range(0..total as u32);
-                        Some(&universe - &deleted)
+                        collection.active_bitmap()
                     }
                     None => None,
                 };

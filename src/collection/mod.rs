@@ -397,7 +397,7 @@ impl Collection {
             base_path: base_path.to_path_buf(),
             deleted_ids: RwLock::new(deleted_ids),
             wal,
-            cached_active_bitmap: RwLock::new(None), // Will be computed on first use
+            cached_active_bitmap: RwLock::new(None),
             query_cache,
             filter_cache,
             query_planner,
@@ -554,6 +554,10 @@ impl Collection {
             text_index.index_document(id, metadata)?;
         }
 
+        // Invalidate caches
+        self.invalidate_active_cache();
+        self.invalidate_query_cache();
+
         // Check if checkpoint is needed
         self.maybe_checkpoint()?;
 
@@ -614,6 +618,10 @@ impl Collection {
                 .collect();
             text_index.index_batch(&docs)?;
         }
+
+        // Invalidate caches
+        self.invalidate_active_cache();
+        self.invalidate_query_cache();
 
         // Check if checkpoint is needed
         self.maybe_checkpoint()?;

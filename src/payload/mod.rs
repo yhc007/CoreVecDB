@@ -122,16 +122,21 @@ impl FieldIndex {
     }
 
     /// Get all IDs matching all of the values (AND).
-    /// Functional: reduce with intersection, short-circuit on empty.
+    /// Uses in-place intersection with early termination on empty.
     pub fn get_all<'a, I>(&self, values: I) -> Option<RoaringBitmap>
     where
         I: IntoIterator<Item = &'a str>,
     {
         let index = self.index.read();
-        values
-            .into_iter()
-            .filter_map(|v| index.get(v).cloned())
-            .reduce(|acc, bitmap| &acc & &bitmap)
+        let mut iter = values.into_iter().filter_map(|v| index.get(v));
+        let mut acc = iter.next()?.clone();
+        for bitmap in iter {
+            acc &= bitmap;
+            if acc.is_empty() {
+                return None;
+            }
+        }
+        Some(acc)
     }
 
     /// Get cardinality (number of unique values).
@@ -198,21 +203,34 @@ pub struct FieldIndexStats {
 // Numeric Field Index (for Range Queries)
 // ============================================================================
 
+/// Inner state for NumericFieldIndex, consolidated under a single lock.
+struct NumericInner {
+    /// value -> bitmap of IDs (sorted by value)
+    index: BTreeMap<i64, RoaringBitmap>,
+    /// ID -> value (for updates/deletes)
+    reverse: HashMap<u32, i64>,
+    /// Statistics
+    min_value: Option<i64>,
+    max_value: Option<i64>,
+}
+
+impl Default for NumericInner {
+    fn default() -> Self {
+        Self {
+            index: BTreeMap::new(),
+            reverse: HashMap::new(),
+            min_value: None,
+            max_value: None,
+        }
+    }
+}
+
 /// Ordered index for numeric fields supporting range queries.
 /// Uses BTreeMap for O(log n) range lookups.
-///
-/// Functional patterns:
-/// - BTreeMap's range iterator for efficient range scans
-/// - fold/reduce for bitmap aggregation
+/// All state consolidated under a single RwLock to avoid multi-lock contention.
 #[derive(Default)]
 pub struct NumericFieldIndex {
-    /// value -> bitmap of IDs (sorted by value)
-    index: RwLock<BTreeMap<i64, RoaringBitmap>>,
-    /// ID -> value (for updates/deletes)
-    reverse: RwLock<HashMap<u32, i64>>,
-    /// Statistics
-    min_value: RwLock<Option<i64>>,
-    max_value: RwLock<Option<i64>>,
+    inner: RwLock<NumericInner>,
 }
 
 impl NumericFieldIndex {
@@ -223,44 +241,30 @@ impl NumericFieldIndex {
     /// Insert a numeric value for an ID.
     pub fn insert(&self, id: u64, value: i64) {
         let id_u32 = id as u32;
+        let mut inner = self.inner.write();
 
         // Remove old value if exists
-        {
-            let reverse = self.reverse.read();
-            if let Some(&old_value) = reverse.get(&id_u32) {
-                drop(reverse);
-                let mut index = self.index.write();
-                if let Some(bitmap) = index.get_mut(&old_value) {
-                    bitmap.remove(id_u32);
-                    if bitmap.is_empty() {
-                        index.remove(&old_value);
-                    }
+        if let Some(&old_value) = inner.reverse.get(&id_u32) {
+            if let Some(bitmap) = inner.index.get_mut(&old_value) {
+                bitmap.remove(id_u32);
+                if bitmap.is_empty() {
+                    inner.index.remove(&old_value);
                 }
             }
         }
 
         // Insert new value
-        {
-            let mut index = self.index.write();
-            index
-                .entry(value)
-                .or_insert_with(RoaringBitmap::new)
-                .insert(id_u32);
-        }
+        inner.index
+            .entry(value)
+            .or_insert_with(RoaringBitmap::new)
+            .insert(id_u32);
 
         // Update reverse index
-        {
-            let mut reverse = self.reverse.write();
-            reverse.insert(id_u32, value);
-        }
+        inner.reverse.insert(id_u32, value);
 
         // Update min/max
-        {
-            let mut min = self.min_value.write();
-            let mut max = self.max_value.write();
-            *min = Some(min.map(|m| m.min(value)).unwrap_or(value));
-            *max = Some(max.map(|m| m.max(value)).unwrap_or(value));
-        }
+        inner.min_value = Some(inner.min_value.map(|m| m.min(value)).unwrap_or(value));
+        inner.max_value = Some(inner.max_value.map(|m| m.max(value)).unwrap_or(value));
     }
 
     /// Insert from float (converts to i64 with 6 decimal precision).
@@ -271,18 +275,13 @@ impl NumericFieldIndex {
     /// Remove an ID from the index.
     pub fn remove(&self, id: u64) {
         let id_u32 = id as u32;
+        let mut inner = self.inner.write();
 
-        let value = {
-            let mut reverse = self.reverse.write();
-            reverse.remove(&id_u32)
-        };
-
-        if let Some(v) = value {
-            let mut index = self.index.write();
-            if let Some(bitmap) = index.get_mut(&v) {
+        if let Some(v) = inner.reverse.remove(&id_u32) {
+            if let Some(bitmap) = inner.index.get_mut(&v) {
                 bitmap.remove(id_u32);
                 if bitmap.is_empty() {
-                    index.remove(&v);
+                    inner.index.remove(&v);
                 }
             }
         }
@@ -290,14 +289,13 @@ impl NumericFieldIndex {
 
     /// Get IDs with exact value.
     pub fn get_eq(&self, value: i64) -> Option<RoaringBitmap> {
-        self.index.read().get(&value).cloned()
+        self.inner.read().index.get(&value).cloned()
     }
 
     /// Get IDs > value.
-    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_gt(&self, value: i64) -> RoaringBitmap {
-        let index = self.index.read();
-        let bitmaps: Vec<&RoaringBitmap> = index
+        let inner = self.inner.read();
+        let bitmaps: Vec<&RoaringBitmap> = inner.index
             .range((std::ops::Bound::Excluded(value), std::ops::Bound::Unbounded))
             .map(|(_, bitmap)| bitmap)
             .collect();
@@ -305,10 +303,9 @@ impl NumericFieldIndex {
     }
 
     /// Get IDs >= value.
-    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_gte(&self, value: i64) -> RoaringBitmap {
-        let index = self.index.read();
-        let bitmaps: Vec<&RoaringBitmap> = index
+        let inner = self.inner.read();
+        let bitmaps: Vec<&RoaringBitmap> = inner.index
             .range(value..)
             .map(|(_, bitmap)| bitmap)
             .collect();
@@ -316,10 +313,9 @@ impl NumericFieldIndex {
     }
 
     /// Get IDs < value.
-    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_lt(&self, value: i64) -> RoaringBitmap {
-        let index = self.index.read();
-        let bitmaps: Vec<&RoaringBitmap> = index
+        let inner = self.inner.read();
+        let bitmaps: Vec<&RoaringBitmap> = inner.index
             .range(..value)
             .map(|(_, bitmap)| bitmap)
             .collect();
@@ -327,10 +323,9 @@ impl NumericFieldIndex {
     }
 
     /// Get IDs <= value.
-    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_lte(&self, value: i64) -> RoaringBitmap {
-        let index = self.index.read();
-        let bitmaps: Vec<&RoaringBitmap> = index
+        let inner = self.inner.read();
+        let bitmaps: Vec<&RoaringBitmap> = inner.index
             .range(..=value)
             .map(|(_, bitmap)| bitmap)
             .collect();
@@ -338,10 +333,9 @@ impl NumericFieldIndex {
     }
 
     /// Get IDs in range [min, max] (inclusive).
-    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_range(&self, min: i64, max: i64) -> RoaringBitmap {
-        let index = self.index.read();
-        let bitmaps: Vec<&RoaringBitmap> = index
+        let inner = self.inner.read();
+        let bitmaps: Vec<&RoaringBitmap> = inner.index
             .range(min..=max)
             .map(|(_, bitmap)| bitmap)
             .collect();
@@ -349,11 +343,10 @@ impl NumericFieldIndex {
     }
 
     /// Get IDs in range (min, max) (exclusive).
-    /// OPTIMIZATION: Uses fast_union to avoid intermediate bitmap allocations.
     pub fn get_range_exclusive(&self, min: i64, max: i64) -> RoaringBitmap {
         use std::ops::Bound;
-        let index = self.index.read();
-        let bitmaps: Vec<&RoaringBitmap> = index
+        let inner = self.inner.read();
+        let bitmaps: Vec<&RoaringBitmap> = inner.index
             .range((Bound::Excluded(min), Bound::Excluded(max)))
             .map(|(_, bitmap)| bitmap)
             .collect();
@@ -362,14 +355,12 @@ impl NumericFieldIndex {
 
     /// Get statistics.
     pub fn stats(&self) -> NumericFieldIndexStats {
-        let index = self.index.read();
-        let count = self.reverse.read().len();
-
+        let inner = self.inner.read();
         NumericFieldIndexStats {
-            unique_values: index.len(),
-            total_ids: count as u64,
-            min_value: *self.min_value.read(),
-            max_value: *self.max_value.read(),
+            unique_values: inner.index.len(),
+            total_ids: inner.reverse.len() as u64,
+            min_value: inner.min_value,
+            max_value: inner.max_value,
         }
     }
 }
@@ -665,7 +656,7 @@ impl PayloadIndex {
     }
 
     /// Filter by multiple conditions (AND).
-    /// Functional: fold with intersection, using Option monad.
+    /// Uses in-place intersection with early termination on empty.
     pub fn filter_and<'a, I>(&self, conditions: I) -> Option<RoaringBitmap>
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -673,12 +664,20 @@ impl PayloadIndex {
         self.stats.lookups.fetch_add(1, Ordering::Relaxed);
         let fields = self.fields.read();
 
-        conditions
+        let mut iter = conditions
             .into_iter()
             .filter_map(|(field, value)| {
                 fields.get(field).and_then(|index| index.get(value))
-            })
-            .reduce(|acc, bitmap| &acc & &bitmap)
+            });
+
+        let mut acc = iter.next()?;
+        for bitmap in iter {
+            acc &= &bitmap;
+            if acc.is_empty() {
+                return None;
+            }
+        }
+        Some(acc)
     }
 
     /// Filter by multiple conditions (OR on same field).
@@ -734,12 +733,17 @@ impl PayloadIndex {
                 self.filter_range(field, float_to_int(*min), float_to_int(*max))
             }
 
-            // Logical operators
+            // Logical operators — in-place intersection with early termination
             FilterQuery::And(queries) => {
-                queries
-                    .iter()
-                    .filter_map(|q| self.evaluate_query(q))
-                    .reduce(|acc, bitmap| &acc & &bitmap)
+                let mut iter = queries.iter().filter_map(|q| self.evaluate_query(q));
+                let mut acc = iter.next()?;
+                for bitmap in iter {
+                    acc &= &bitmap;
+                    if acc.is_empty() {
+                        return None;
+                    }
+                }
+                Some(acc)
             }
 
             FilterQuery::Or(queries) => {

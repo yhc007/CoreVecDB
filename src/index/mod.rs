@@ -280,11 +280,21 @@ impl HnswIndexer {
         k: usize,
         filter: Option<&roaring::RoaringBitmap>,
     ) -> Result<Vec<(u64, f32)>> {
+        let ef_search = 32.max(k);
+        self.search_with_ef(vector, k, filter, ef_search)
+    }
+
+    /// Search with a custom ef_search parameter for adaptive filtering.
+    pub fn search_with_ef(
+        &self,
+        vector: &[f32],
+        k: usize,
+        filter: Option<&roaring::RoaringBitmap>,
+        ef_search: usize,
+    ) -> Result<Vec<(u64, f32)>> {
         if vector.len() != self.dim {
             return Err(anyhow::anyhow!("Vector dimension mismatch"));
         }
-
-        let ef_search = 32.max(k);
 
         let results = match &self.inner {
             HnswInner::L2(h) => {

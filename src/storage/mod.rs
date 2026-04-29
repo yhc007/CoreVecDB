@@ -115,6 +115,18 @@ pub trait MetadataStore: Send + Sync {
         None // Default: no indexing available
     }
 
+    /// Batch get a single field for multiple IDs.
+    /// Returns a map of id -> value for IDs that have the field.
+    fn get_batch(&self, ids: &[u64], key: &str) -> Result<std::collections::HashMap<u64, String>> {
+        let mut result = std::collections::HashMap::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(value) = self.get(id, key)? {
+                result.insert(id, value);
+            }
+        }
+        Ok(result)
+    }
+
     /// Batch insert metadata entries.
     /// Default implementation calls insert() in a loop.
     fn insert_batch(&self, entries: &[MetadataEntry]) -> Result<()> {

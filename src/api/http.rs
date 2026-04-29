@@ -912,18 +912,8 @@ async fn collection_search(
         }
     }
 
-    // 5. Exclude deleted vectors
-    let deleted_bitmap = collection.deleted_bitmap();
-    if !deleted_bitmap.is_empty() {
-        // Create universe bitmap (all valid IDs)
-        let total = collection.len() as u64;
-        let mut universe = roaring::RoaringBitmap::new();
-        universe.insert_range(0..total as u32);
-
-        // Remove deleted IDs from universe
-        let active_bitmap = &universe - &deleted_bitmap;
-
-        // Combine with existing filter
+    // 5. Exclude deleted vectors (using cached active bitmap)
+    if let Some(active_bitmap) = collection.active_bitmap() {
         filter_bitmap = Some(
             filter_bitmap
                 .map(|existing| existing & &active_bitmap)
@@ -937,20 +927,27 @@ async fn collection_search(
     let include_meta = payload.include_metadata;
 
     let final_results: Vec<JsonSearchResult> = if has_metadata_filter && !used_index_filter {
-        // Post-filter: can't cache since results depend on runtime filtering
+        // Batch post-filter: fetch all filter fields at once instead of per-result lookups
+        let result_ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        let mut passing_ids = std::collections::HashSet::with_capacity(result_ids.len());
+        passing_ids.extend(result_ids.iter().copied());
+
+        for (fk, fv) in &payload.filter {
+            if let Ok(batch) = collection.metadata_store.get_batch(&result_ids, fk) {
+                passing_ids.retain(|id| {
+                    batch.get(id).map(|v| v == fv).unwrap_or(false)
+                });
+            } else {
+                passing_ids.clear();
+            }
+            if passing_ids.is_empty() {
+                break;
+            }
+        }
+
         results
             .into_iter()
-            .filter(|(id, _)| {
-                payload.filter.iter().all(|(fk, fv)| {
-                    collection.metadata_store
-                        .get(*id, fk)
-                        .ok()
-                        .flatten()
-                        .as_ref()
-                        .map(|v| v == fv)
-                        .unwrap_or(false)
-                })
-            })
+            .filter(|(id, _)| passing_ids.contains(id))
             .map(|(id, score)| {
                 let metadata = if include_meta {
                     Some(collection.metadata_store.get_all(id))
@@ -1266,16 +1263,11 @@ async fn collection_stream_search(
     }
 
     // Exclude deleted vectors
-    let deleted_bitmap = collection.deleted_bitmap();
-    if !deleted_bitmap.is_empty() {
-        let total = collection.len() as u64;
-        let mut universe = roaring::RoaringBitmap::new();
-        universe.insert_range(0..total as u32);
-        let active_bitmap = &universe - &deleted_bitmap;
+    if let Some(active) = collection.active_bitmap() {
         filter_bitmap = Some(
             filter_bitmap
-                .map(|existing| existing & &active_bitmap)
-                .unwrap_or(active_bitmap)
+                .map(|existing| existing & &active)
+                .unwrap_or(active)
         );
     }
 
@@ -1556,16 +1548,10 @@ async fn collection_multi_search(
     };
 
     // Exclude deleted IDs from filter
-    let deleted = collection.deleted_bitmap();
-    let effective_filter = if !deleted.is_empty() {
-        let total = collection.len() as u64;
-        let mut universe = roaring::RoaringBitmap::new();
-        universe.insert_range(0..total as u32);
-        let allowed = &universe - &deleted;
-
+    let effective_filter = if let Some(active) = collection.active_bitmap() {
         match filter_bitmap {
-            Some(f) => Some(&f & &allowed),
-            None => Some(allowed),
+            Some(f) => Some(&f & &active),
+            None => Some(active),
         }
     } else {
         filter_bitmap
@@ -1807,15 +1793,10 @@ async fn collection_hybrid_dense_sparse(
     };
 
     // Exclude deleted IDs
-    let deleted = collection.deleted_bitmap();
-    let effective_filter = if !deleted.is_empty() {
-        let total = collection.len() as u64;
-        let mut universe = roaring::RoaringBitmap::new();
-        universe.insert_range(0..total as u32);
-        let allowed = &universe - &deleted;
+    let effective_filter = if let Some(active) = collection.active_bitmap() {
         match filter_bitmap {
-            Some(f) => Some(&f & &allowed),
-            None => Some(allowed),
+            Some(f) => Some(&f & &active),
+            None => Some(active),
         }
     } else {
         filter_bitmap
@@ -2548,16 +2529,11 @@ async fn legacy_search(
     }
 
     // 5. Exclude deleted vectors
-    let deleted_bitmap = collection.deleted_bitmap();
-    if !deleted_bitmap.is_empty() {
-        let total = collection.len() as u64;
-        let mut universe = roaring::RoaringBitmap::new();
-        universe.insert_range(0..total as u32);
-        let active_bitmap = &universe - &deleted_bitmap;
+    if let Some(active) = collection.active_bitmap() {
         filter_bitmap = Some(
             filter_bitmap
-                .map(|existing| existing & &active_bitmap)
-                .unwrap_or(active_bitmap)
+                .map(|existing| existing & &active)
+                .unwrap_or(active)
         );
     }
 
@@ -2567,19 +2543,27 @@ async fn legacy_search(
     let include_meta = payload.include_metadata;
 
     let final_results: Vec<JsonSearchResult> = if has_metadata_filter && !used_index_filter {
+        // Batch post-filter
+        let result_ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        let mut passing_ids = std::collections::HashSet::with_capacity(result_ids.len());
+        passing_ids.extend(result_ids.iter().copied());
+
+        for (fk, fv) in &payload.filter {
+            if let Ok(batch) = collection.metadata_store.get_batch(&result_ids, fk) {
+                passing_ids.retain(|id| {
+                    batch.get(id).map(|v| v == fv).unwrap_or(false)
+                });
+            } else {
+                passing_ids.clear();
+            }
+            if passing_ids.is_empty() {
+                break;
+            }
+        }
+
         results
             .into_iter()
-            .filter(|(id, _)| {
-                payload.filter.iter().all(|(fk, fv)| {
-                    collection.metadata_store
-                        .get(*id, fk)
-                        .ok()
-                        .flatten()
-                        .as_ref()
-                        .map(|v| v == fv)
-                        .unwrap_or(false)
-                })
-            })
+            .filter(|(id, _)| passing_ids.contains(id))
             .map(|(id, score)| {
                 let metadata = if include_meta {
                     Some(collection.metadata_store.get_all(id))
