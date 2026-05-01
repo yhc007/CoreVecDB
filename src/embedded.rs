@@ -15,7 +15,7 @@
 //!     .with_indexed_fields(vec!["category"], vec!["price"]);
 //! db.create_collection(config)?;
 //!
-//! let col = db.collection("products").unwrap();
+//! let col = db.collection("products")?;
 //! let id = col.insert(&[0.1; 128], &[("category", "electronics")])?;
 //!
 //! let results = col.search(
@@ -25,7 +25,6 @@
 //! )?;
 //! ```
 
-use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -34,6 +33,10 @@ use crate::collection::{
     SearchParams, SearchResult,
 };
 use crate::text::HybridSearchResult;
+use crate::VecDbError;
+
+/// Result type for embedded API.
+pub type Result<T> = std::result::Result<T, VecDbError>;
 
 /// Embedded vector database — zero network overhead.
 ///
@@ -58,8 +61,11 @@ impl CoreVecDB {
     }
 
     /// Get a handle to an existing collection.
-    pub fn collection(&self, name: &str) -> Option<CollectionHandle> {
-        self.manager.get(name).map(|c| CollectionHandle { inner: c })
+    pub fn collection(&self, name: &str) -> Result<CollectionHandle> {
+        self.manager
+            .get(name)
+            .map(|c| CollectionHandle { inner: c })
+            .ok_or_else(|| VecDbError::NotFound(name.to_string()))
     }
 
     /// Get or create a default collection with the given dimension.
@@ -75,12 +81,14 @@ impl CoreVecDB {
 
     /// Drop a collection and delete its data.
     pub fn drop_collection(&self, name: &str) -> Result<()> {
-        self.manager.delete(name)
+        self.manager.delete(name)?;
+        Ok(())
     }
 
     /// Flush all collections to disk.
     pub fn flush(&self) -> Result<()> {
-        self.manager.flush_all()
+        self.manager.flush_all()?;
+        Ok(())
     }
 
     /// Get the underlying CollectionManager (for advanced usage).
@@ -90,6 +98,7 @@ impl CoreVecDB {
 }
 
 /// Handle to a single collection with ergonomic API.
+#[derive(Clone)]
 pub struct CollectionHandle {
     inner: Arc<Collection>,
 }
@@ -101,7 +110,7 @@ impl CollectionHandle {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        self.inner.insert(vector, &meta)
+        self.inner.insert(vector, &meta).map_err(Into::into)
     }
 
     /// Insert a batch of vectors with metadata.
@@ -110,12 +119,12 @@ impl CollectionHandle {
         vectors: &[Vec<f32>],
         metadata: &[Vec<(String, String)>],
     ) -> Result<u64> {
-        self.inner.insert_batch(vectors, metadata)
+        self.inner.insert_batch(vectors, metadata).map_err(Into::into)
     }
 
     /// Search with full filter support.
     pub fn search(&self, params: SearchParams) -> Result<Vec<SearchResult>> {
-        self.inner.search(params)
+        self.inner.search(params).map_err(Into::into)
     }
 
     /// Hybrid vector + text search.
@@ -126,7 +135,7 @@ impl CollectionHandle {
         k: usize,
         alpha: f32,
     ) -> Result<Vec<HybridSearchResult>> {
-        self.inner.hybrid_search(vector, query, k, alpha, false)
+        self.inner.hybrid_search(vector, query, k, alpha, false).map_err(Into::into)
     }
 
     /// Hybrid search with RRF (Reciprocal Rank Fusion) instead of linear combination.
@@ -136,17 +145,17 @@ impl CollectionHandle {
         query: &str,
         k: usize,
     ) -> Result<Vec<HybridSearchResult>> {
-        self.inner.hybrid_search(vector, query, k, 0.5, true)
+        self.inner.hybrid_search(vector, query, k, 0.5, true).map_err(Into::into)
     }
 
     /// Delete a vector by ID.
     pub fn delete(&self, id: u64) -> Result<bool> {
-        self.inner.delete(id)
+        self.inner.delete(id).map_err(Into::into)
     }
 
     /// Delete multiple vectors by ID.
     pub fn delete_batch(&self, ids: &[u64]) -> Result<usize> {
-        self.inner.delete_batch(ids)
+        self.inner.delete_batch(ids).map_err(Into::into)
     }
 
     /// Get total vector count (including deleted).
@@ -166,7 +175,7 @@ impl CollectionHandle {
 
     /// Flush to disk.
     pub fn flush(&self) -> Result<()> {
-        self.inner.flush()
+        self.inner.flush().map_err(Into::into)
     }
 
     /// Get the underlying Collection (for advanced usage).

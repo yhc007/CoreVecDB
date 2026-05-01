@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::convert::Infallible;
 use futures::stream::Stream;
 use crate::api::{create_filter_bitmap, create_range_bitmap};
-use crate::collection::{CollectionManager, CollectionConfig, CollectionInfo, SnapshotInfo, WalConfigWrapper};
+use crate::collection::{CollectionManager, CollectionConfig, CollectionInfo, RangeFilter, SnapshotInfo, WalConfigWrapper};
 use crate::storage::{MetadataEntry, IndexedMetadata};
 use crate::payload::FilterQuery;
 use crate::replication::{ReplicationManager, ReplicationRole};
@@ -52,67 +52,7 @@ pub struct JsonBatchUpsertResp {
     success: bool,
 }
 
-/// Range filter for numeric fields.
-#[derive(Deserialize, Clone)]
-#[serde(tag = "op")]
-pub enum RangeFilter {
-    /// Greater than: field > value
-    #[serde(rename = "gt")]
-    Gt { field: String, value: f64 },
-    /// Greater than or equal: field >= value
-    #[serde(rename = "gte")]
-    Gte { field: String, value: f64 },
-    /// Less than: field < value
-    #[serde(rename = "lt")]
-    Lt { field: String, value: f64 },
-    /// Less than or equal: field <= value
-    #[serde(rename = "lte")]
-    Lte { field: String, value: f64 },
-    /// Range: min <= field <= max (inclusive)
-    #[serde(rename = "range")]
-    Range { field: String, min: f64, max: f64 },
-    /// Between: min < field < max (exclusive)
-    #[serde(rename = "between")]
-    Between { field: String, min: f64, max: f64 },
-}
-
-impl RangeFilter {
-    /// Convert to FilterQuery for use with PayloadIndex.
-    fn to_filter_query(&self) -> FilterQuery {
-        match self {
-            RangeFilter::Gt { field, value } => FilterQuery::gt_f(field, *value),
-            RangeFilter::Gte { field, value } => FilterQuery::gte_f(field, *value),
-            RangeFilter::Lt { field, value } => FilterQuery::lt_f(field, *value),
-            RangeFilter::Lte { field, value } => FilterQuery::lte_f(field, *value),
-            RangeFilter::Range { field, min, max } => FilterQuery::range_f(field, *min, *max),
-            RangeFilter::Between { field, min, max } => {
-                // Between is min < field < max, using AND of Gt and Lt
-                FilterQuery::and(vec![
-                    FilterQuery::gt_f(field, *min),
-                    FilterQuery::lt_f(field, *max),
-                ])
-            }
-        }
-    }
-
-    /// Convert HTTP RangeFilter to collection-level RangeFilter.
-    fn to_collection_range_filter(&self) -> crate::collection::RangeFilter {
-        match self {
-            RangeFilter::Gt { field, value } =>
-                crate::collection::RangeFilter::Gt { field: field.clone(), value: *value },
-            RangeFilter::Gte { field, value } =>
-                crate::collection::RangeFilter::Gte { field: field.clone(), value: *value },
-            RangeFilter::Lt { field, value } =>
-                crate::collection::RangeFilter::Lt { field: field.clone(), value: *value },
-            RangeFilter::Lte { field, value } =>
-                crate::collection::RangeFilter::Lte { field: field.clone(), value: *value },
-            RangeFilter::Range { field, min, max } =>
-                crate::collection::RangeFilter::Range { field: field.clone(), min: *min, max: *max },
-            RangeFilter::Between { field, min, max } =>
-                crate::collection::RangeFilter::Between { field: field.clone(), min: *min, max: *max },
-        }
-    }
-}
+// RangeFilter is imported from crate::collection — single source of truth.
 
 /// Apply range filters using IndexedMetadata.
 /// Returns bitmap of matching IDs.
@@ -851,7 +791,7 @@ async fn collection_search(
         vector: payload.vector,
         k: payload.k as usize,
         filter: payload.filter.into_iter().collect(),
-        range_filters: payload.range_filters.iter().map(|rf| rf.to_collection_range_filter()).collect(),
+        range_filters: payload.range_filters,
         filter_ids: payload.filter_ids,
         filter_id_range: payload.filter_id_range,
         include_metadata: payload.include_metadata,

@@ -229,7 +229,8 @@ impl CollectionConfig {
 
 /// Range filter for numeric fields.
 /// Used in both HTTP API and embedded API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum RangeFilter {
     /// Greater than: field > value
     Gt { field: String, value: f64 },
@@ -405,30 +406,37 @@ impl Collection {
 
         // Create vector store
         let dim = config.dim;
+        let vector_path_str = vector_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid UTF-8 in vector path: {:?}", vector_path))?;
+        let meta_path_str = meta_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid UTF-8 in metadata path: {:?}", meta_path))?;
+        let index_path_str = index_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid UTF-8 in index path: {:?}", index_path))?;
+
         let vector_store: Arc<dyn VectorStore> = if config.quantization.enabled {
             Arc::new(QuantizedMemmapVectorStore::new(
-                vector_path.to_str().unwrap(),
+                vector_path_str,
                 dim,
                 config.quantization.keep_originals,
             )?)
         } else {
-            let path = format!("{}.bin", vector_path.to_str().unwrap());
+            let path = format!("{}.bin", vector_path_str);
             Arc::new(MemmapVectorStore::new(&path, dim)?)
         };
 
         // Create metadata store
         let metadata_store: Arc<dyn MetadataStore> = if config.payload.index_enabled {
             Arc::new(IndexedSledMetadataStore::with_numeric_fields(
-                meta_path.to_str().unwrap(),
+                meta_path_str,
                 config.payload.indexed_fields.iter().map(|s| s.as_str()),
                 config.payload.numeric_fields.iter().map(|s| s.as_str()),
             )?)
         } else {
-            Arc::new(SledMetadataStore::new(meta_path.to_str().unwrap())?)
+            Arc::new(SledMetadataStore::new(meta_path_str)?)
         };
 
         // Create or load index with the configured distance metric
-        let graph_path = format!("{}.hnsw.graph", index_path.to_str().unwrap());
+        let graph_path = format!("{}.hnsw.graph", index_path_str);
         let distance_metric = config.distance_metric();
         let indexer = if Path::new(&graph_path).exists() {
             Arc::new(HnswIndexer::load(
@@ -956,6 +964,8 @@ impl Collection {
     /// This is the in-process equivalent of the HTTP search handler.
     pub fn search(&self, params: SearchParams) -> Result<Vec<SearchResult>> {
         let mut filter_bitmap: Option<RoaringBitmap> = None;
+        // Keep Arc reference to avoid deep clone when no other filters need AND-ing
+        let mut cached_bitmap_arc: Option<Arc<RoaringBitmap>> = None;
 
         // 1. String field filters (exact match) — with filter cache
         let has_metadata_filter = !params.filter.is_empty();
@@ -968,7 +978,7 @@ impl Collection {
 
             if let Some(ref filter_cache) = self.filter_cache {
                 if let Some(cached_bitmap) = filter_cache.get(&filter_cache_key) {
-                    filter_bitmap = Some(cached_bitmap.as_ref().clone());
+                    cached_bitmap_arc = Some(cached_bitmap);
                     true
                 } else {
                     let filter_plan = self.plan_filters(
@@ -997,6 +1007,19 @@ impl Collection {
             false
         };
 
+        // Materialize cached Arc bitmap into filter_bitmap only when needed for AND-ing
+        let needs_more_filters = !params.range_filters.is_empty()
+            || params.filter_id_range.is_some()
+            || params.filter_ids.as_ref().map_or(false, |ids| !ids.is_empty())
+            || self.active_bitmap().is_some();
+
+        if let Some(ref arc_bm) = cached_bitmap_arc {
+            if needs_more_filters {
+                filter_bitmap = Some(arc_bm.as_ref().clone());
+                cached_bitmap_arc = None;
+            }
+        }
+
         // 2. Range filters (numeric fields)
         if !params.range_filters.is_empty() {
             if let Some(indexed_store) = self.metadata_store
@@ -1015,8 +1038,12 @@ impl Collection {
 
         // 3. ID range filter
         if let Some((start, end)) = params.filter_id_range {
+            let start_u32 = u32::try_from(start)
+                .map_err(|_| anyhow::anyhow!("filter_id_range start {} exceeds u32::MAX", start))?;
+            let end_u32 = u32::try_from(end)
+                .map_err(|_| anyhow::anyhow!("filter_id_range end {} exceeds u32::MAX", end))?;
             let mut rb = RoaringBitmap::new();
-            rb.insert_range(start as u32..=end as u32);
+            rb.insert_range(start_u32..=end_u32);
             filter_bitmap = Some(
                 filter_bitmap
                     .map(|existing| existing & &rb)
@@ -1027,7 +1054,10 @@ impl Collection {
         // 4. Explicit ID filter
         if let Some(ref ids) = params.filter_ids {
             if !ids.is_empty() {
-                let mut ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+                let mut ids_u32: Vec<u32> = ids.iter()
+                    .map(|&id| u32::try_from(id)
+                        .map_err(|_| anyhow::anyhow!("filter_id {} exceeds u32::MAX", id)))
+                    .collect::<Result<Vec<_>>>()?;
                 ids_u32.sort_unstable();
                 let id_bitmap = RoaringBitmap::from_sorted_iter(ids_u32.into_iter())
                     .unwrap_or_default();
@@ -1048,8 +1078,12 @@ impl Collection {
             );
         }
 
-        // Execute search
-        let results = self.adaptive_search(&params.vector, params.k, filter_bitmap.as_ref())?;
+        // Execute search — use Arc reference directly if no other filters were applied
+        let results = if let Some(ref arc_bm) = cached_bitmap_arc {
+            self.adaptive_search(&params.vector, params.k, Some(arc_bm.as_ref()))?
+        } else {
+            self.adaptive_search(&params.vector, params.k, filter_bitmap.as_ref())?
+        };
 
         // Post-filter + build results
         let include_meta = params.include_metadata;
@@ -1428,27 +1462,31 @@ impl Collection {
         // Create new vector store
         let vector_path = temp_dir.join("vectors");
         let dim = self.config.dim;
+        let vector_path_str = vector_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid UTF-8 in vector path: {:?}", vector_path))?;
         let new_vector_store: Box<dyn VectorStore> = if self.config.quantization.enabled {
             Box::new(QuantizedMemmapVectorStore::new(
-                vector_path.to_str().unwrap(),
+                vector_path_str,
                 dim,
                 self.config.quantization.keep_originals,
             )?)
         } else {
-            let path = format!("{}.bin", vector_path.to_str().unwrap());
+            let path = format!("{}.bin", vector_path_str);
             Box::new(MemmapVectorStore::new(&path, dim)?)
         };
 
         // Create new metadata store
         let meta_path = temp_dir.join("meta.sled");
+        let meta_path_str = meta_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid UTF-8 in metadata path: {:?}", meta_path))?;
         let new_metadata_store: Box<dyn MetadataStore> = if self.config.payload.index_enabled {
             Box::new(IndexedSledMetadataStore::with_numeric_fields(
-                meta_path.to_str().unwrap(),
+                meta_path_str,
                 self.config.payload.indexed_fields.iter().map(|s| s.as_str()),
                 self.config.payload.numeric_fields.iter().map(|s| s.as_str()),
             )?)
         } else {
-            Box::new(SledMetadataStore::new(meta_path.to_str().unwrap())?)
+            Box::new(SledMetadataStore::new(meta_path_str)?)
         };
 
         // OPTIMIZATION: Batch process vectors for compaction (3-5x faster)
@@ -2202,6 +2240,108 @@ mod tests {
         assert!(manager.get("users").is_none());
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Helper: create a collection with indexed fields, insert test vectors.
+    fn setup_search_collection(name: &str) -> (std::path::PathBuf, Arc<Collection>) {
+        let dir = test_dir(name);
+        let config = CollectionConfig::new("test", 4)
+            .with_indexed_fields(vec!["category".to_string()], vec![]);
+        let col = Arc::new(Collection::open(&dir, config).unwrap());
+
+        // Insert 5 vectors with category metadata
+        let categories = ["electronics", "electronics", "books", "books", "clothing"];
+        for (i, cat) in categories.iter().enumerate() {
+            let v = vec![i as f32; 4];
+            let meta = vec![("category".to_string(), cat.to_string())];
+            col.insert(&v, &meta).unwrap();
+        }
+        (dir, col)
+    }
+
+    #[test]
+    fn test_search_no_filter() {
+        let (dir, col) = setup_search_collection("search_no_filter");
+        let query = vec![1.0; 4];
+        let params = SearchParams::new(query, 5);
+        let results = col.search(params).unwrap();
+        assert!(!results.is_empty());
+        assert!(results.len() <= 5);
+        // Metadata should not be included by default
+        assert!(results[0].metadata.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_with_string_filter() {
+        let (dir, col) = setup_search_collection("search_string_filter");
+        let query = vec![1.0; 4];
+        let params = SearchParams::new(query, 10)
+            .with_filter("category", "electronics")
+            .with_metadata();
+        let results = col.search(params).unwrap();
+        // Should only return electronics (IDs 0 and 1)
+        assert!(results.len() <= 2);
+        for r in &results {
+            let meta = r.metadata.as_ref().unwrap();
+            assert_eq!(meta.get("category").unwrap(), "electronics");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_with_id_filter() {
+        let (dir, col) = setup_search_collection("search_id_filter");
+        let query = vec![1.0; 4];
+        let params = SearchParams::new(query, 10)
+            .with_filter_ids(vec![0, 2]);
+        let results = col.search(params).unwrap();
+        // Should only return IDs 0 and 2
+        for r in &results {
+            assert!(r.id == 0 || r.id == 2, "unexpected id: {}", r.id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_with_id_range_filter() {
+        let (dir, col) = setup_search_collection("search_id_range");
+        let query = vec![1.0; 4];
+        let params = SearchParams::new(query, 10)
+            .with_filter_id_range(1, 3);
+        let results = col.search(params).unwrap();
+        for r in &results {
+            assert!((1..=3).contains(&r.id), "id {} out of range [1,3]", r.id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_with_metadata() {
+        let (dir, col) = setup_search_collection("search_with_metadata");
+        let query = vec![1.0; 4];
+        let params = SearchParams::new(query, 5).with_metadata();
+        let results = col.search(params).unwrap();
+        for r in &results {
+            assert!(r.metadata.is_some(), "metadata should be included");
+            let meta = r.metadata.as_ref().unwrap();
+            assert!(meta.contains_key("category"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_after_delete() {
+        let (dir, col) = setup_search_collection("search_after_delete");
+        // Delete ID 0
+        col.delete(0).unwrap();
+        let query = vec![0.0; 4]; // closest to deleted vector
+        let params = SearchParams::new(query, 10);
+        let results = col.search(params).unwrap();
+        for r in &results {
+            assert_ne!(r.id, 0, "deleted vector should not appear");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

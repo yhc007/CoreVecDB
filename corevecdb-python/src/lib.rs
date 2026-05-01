@@ -2,7 +2,6 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use numpy::PyReadonlyArray1;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use vectordb::collection::{
     CollectionConfig, SearchParams,
@@ -60,8 +59,8 @@ impl CoreVecDB {
     fn collection(&self, name: &str) -> PyResult<CollectionHandle> {
         self.inner
             .collection(name)
-            .map(|h| CollectionHandle { inner: Arc::new(h) })
-            .ok_or_else(|| PyValueError::new_err(format!("Collection '{}' not found", name)))
+            .map(|h| CollectionHandle { inner: h })
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))
     }
 
     /// List all collections.
@@ -94,8 +93,9 @@ impl CoreVecDB {
 
 /// Collection handle for vector operations.
 #[pyclass]
+#[derive(Clone)]
 struct CollectionHandle {
-    inner: Arc<vectordb::embedded::CollectionHandle>,
+    inner: vectordb::embedded::CollectionHandle,
 }
 
 #[pymethods]
