@@ -1,0 +1,14 @@
+[package]
+name = "corevecdb"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "corevecdb"
+crate-type = ["cdylib"]
+
+[dependencies]
+vectordb = { path = "..", default-features = false }
+pyo3 = { version = "0.24", features = ["extension-module"] }
+numpy = "0.24"
+anyhow = "1.0"

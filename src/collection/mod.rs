@@ -227,6 +227,119 @@ impl CollectionConfig {
     }
 }
 
+/// Range filter for numeric fields.
+/// Used in both HTTP API and embedded API.
+#[derive(Debug, Clone)]
+pub enum RangeFilter {
+    /// Greater than: field > value
+    Gt { field: String, value: f64 },
+    /// Greater than or equal: field >= value
+    Gte { field: String, value: f64 },
+    /// Less than: field < value
+    Lt { field: String, value: f64 },
+    /// Less than or equal: field <= value
+    Lte { field: String, value: f64 },
+    /// Range: min <= field <= max (inclusive)
+    Range { field: String, min: f64, max: f64 },
+    /// Between: min < field < max (exclusive)
+    Between { field: String, min: f64, max: f64 },
+}
+
+impl RangeFilter {
+    /// Convert to FilterQuery for use with PayloadIndex.
+    pub fn to_filter_query(&self) -> crate::payload::FilterQuery {
+        use crate::payload::FilterQuery;
+        match self {
+            RangeFilter::Gt { field, value } => FilterQuery::gt_f(field, *value),
+            RangeFilter::Gte { field, value } => FilterQuery::gte_f(field, *value),
+            RangeFilter::Lt { field, value } => FilterQuery::lt_f(field, *value),
+            RangeFilter::Lte { field, value } => FilterQuery::lte_f(field, *value),
+            RangeFilter::Range { field, min, max } => FilterQuery::range_f(field, *min, *max),
+            RangeFilter::Between { field, min, max } => {
+                FilterQuery::and(vec![
+                    FilterQuery::gt_f(field, *min),
+                    FilterQuery::lt_f(field, *max),
+                ])
+            }
+        }
+    }
+}
+
+/// High-level search parameters for embedded (in-process) API.
+#[derive(Debug, Clone)]
+pub struct SearchParams {
+    /// Query vector
+    pub vector: Vec<f32>,
+    /// Number of results to return
+    pub k: usize,
+    /// Exact match filters (AND)
+    pub filter: Vec<(String, String)>,
+    /// Numeric range filters (AND with other filters)
+    pub range_filters: Vec<RangeFilter>,
+    /// Explicit ID filter (only search within these IDs)
+    pub filter_ids: Option<Vec<u64>>,
+    /// ID range filter [start, end] inclusive
+    pub filter_id_range: Option<(u64, u64)>,
+    /// Include metadata in results
+    pub include_metadata: bool,
+}
+
+impl SearchParams {
+    /// Create minimal search params with just vector and k.
+    pub fn new(vector: Vec<f32>, k: usize) -> Self {
+        Self {
+            vector,
+            k,
+            filter: Vec::new(),
+            range_filters: Vec::new(),
+            filter_ids: None,
+            filter_id_range: None,
+            include_metadata: false,
+        }
+    }
+
+    /// Builder: add exact match filter.
+    pub fn with_filter(mut self, field: impl Into<String>, value: impl Into<String>) -> Self {
+        self.filter.push((field.into(), value.into()));
+        self
+    }
+
+    /// Builder: add range filter.
+    pub fn with_range_filter(mut self, range_filter: RangeFilter) -> Self {
+        self.range_filters.push(range_filter);
+        self
+    }
+
+    /// Builder: set explicit ID filter.
+    pub fn with_filter_ids(mut self, ids: Vec<u64>) -> Self {
+        self.filter_ids = Some(ids);
+        self
+    }
+
+    /// Builder: set ID range filter.
+    pub fn with_filter_id_range(mut self, start: u64, end: u64) -> Self {
+        self.filter_id_range = Some((start, end));
+        self
+    }
+
+    /// Builder: include metadata in results.
+    pub fn with_metadata(mut self) -> Self {
+        self.include_metadata = true;
+        self
+    }
+}
+
+/// Search result from embedded API.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    /// Vector ID
+    pub id: u64,
+    /// Similarity/distance score
+    pub score: f32,
+    /// Metadata (only present when include_metadata=true)
+    pub metadata: Option<HashMap<String, String>>,
+}
+
 /// A single collection containing vectors, index, and metadata.
 pub struct Collection {
     /// Configuration
@@ -834,6 +947,181 @@ impl Collection {
         } else {
             self.indexer.search(query, k, filter)
         }
+    }
+
+    /// High-level search with full filter support.
+    ///
+    /// Builds filter bitmaps (string/range/ID/active), runs HNSW search,
+    /// and applies post-filtering for non-indexed fields.
+    /// This is the in-process equivalent of the HTTP search handler.
+    pub fn search(&self, params: SearchParams) -> Result<Vec<SearchResult>> {
+        let mut filter_bitmap: Option<RoaringBitmap> = None;
+
+        // 1. String field filters (exact match) — with filter cache
+        let has_metadata_filter = !params.filter.is_empty();
+        let used_index_filter = if has_metadata_filter {
+            let raw_conditions: Vec<(&str, &str)> = params.filter
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let filter_cache_key = FilterBitmapCache::normalize_key(&raw_conditions);
+
+            if let Some(ref filter_cache) = self.filter_cache {
+                if let Some(cached_bitmap) = filter_cache.get(&filter_cache_key) {
+                    filter_bitmap = Some(cached_bitmap.as_ref().clone());
+                    true
+                } else {
+                    let filter_plan = self.plan_filters(
+                        params.filter.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+                    );
+                    let conditions: Vec<(&str, &str)> = filter_plan.filters
+                        .iter()
+                        .map(|f| (f.field.as_str(), f.value.as_str()))
+                        .collect();
+
+                    if let Some(indexed_bitmap) = self.metadata_store.try_filter_and(&conditions) {
+                        filter_cache.put(filter_cache_key, indexed_bitmap.clone());
+                        filter_bitmap = Some(indexed_bitmap);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            } else if let Some(indexed_bitmap) = self.metadata_store.try_filter_and(&raw_conditions) {
+                filter_bitmap = Some(indexed_bitmap);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // 2. Range filters (numeric fields)
+        if !params.range_filters.is_empty() {
+            if let Some(indexed_store) = self.metadata_store
+                .as_any()
+                .and_then(|any| any.downcast_ref::<IndexedSledMetadataStore>())
+            {
+                if let Some(range_bitmap) = Self::apply_range_filters(indexed_store, &params.range_filters) {
+                    filter_bitmap = Some(
+                        filter_bitmap
+                            .map(|existing| existing & &range_bitmap)
+                            .unwrap_or(range_bitmap)
+                    );
+                }
+            }
+        }
+
+        // 3. ID range filter
+        if let Some((start, end)) = params.filter_id_range {
+            let mut rb = RoaringBitmap::new();
+            rb.insert_range(start as u32..=end as u32);
+            filter_bitmap = Some(
+                filter_bitmap
+                    .map(|existing| existing & &rb)
+                    .unwrap_or(rb)
+            );
+        }
+
+        // 4. Explicit ID filter
+        if let Some(ref ids) = params.filter_ids {
+            if !ids.is_empty() {
+                let mut ids_u32: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+                ids_u32.sort_unstable();
+                let id_bitmap = RoaringBitmap::from_sorted_iter(ids_u32.into_iter())
+                    .unwrap_or_default();
+                filter_bitmap = Some(
+                    filter_bitmap
+                        .map(|existing| existing & &id_bitmap)
+                        .unwrap_or(id_bitmap)
+                );
+            }
+        }
+
+        // 5. Exclude deleted vectors
+        if let Some(active_bitmap) = self.active_bitmap() {
+            filter_bitmap = Some(
+                filter_bitmap
+                    .map(|existing| existing & &active_bitmap)
+                    .unwrap_or(active_bitmap)
+            );
+        }
+
+        // Execute search
+        let results = self.adaptive_search(&params.vector, params.k, filter_bitmap.as_ref())?;
+
+        // Post-filter + build results
+        let include_meta = params.include_metadata;
+        if has_metadata_filter && !used_index_filter {
+            // Batch post-filter for non-indexed fields
+            let result_ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+            let mut passing_ids = std::collections::HashSet::with_capacity(result_ids.len());
+            passing_ids.extend(result_ids.iter().copied());
+
+            for (fk, fv) in &params.filter {
+                if let Ok(batch) = self.metadata_store.get_batch(&result_ids, fk) {
+                    passing_ids.retain(|id| {
+                        batch.get(id).map(|v| v == fv).unwrap_or(false)
+                    });
+                } else {
+                    passing_ids.clear();
+                }
+                if passing_ids.is_empty() {
+                    break;
+                }
+            }
+
+            Ok(results
+                .into_iter()
+                .filter(|(id, _)| passing_ids.contains(id))
+                .map(|(id, score)| {
+                    let metadata = if include_meta {
+                        Some(self.metadata_store.get_all(id))
+                    } else {
+                        None
+                    };
+                    SearchResult { id, score, metadata }
+                })
+                .collect())
+        } else {
+            Ok(results
+                .into_iter()
+                .map(|(id, score)| {
+                    let metadata = if include_meta {
+                        Some(self.metadata_store.get_all(id))
+                    } else {
+                        None
+                    };
+                    SearchResult { id, score, metadata }
+                })
+                .collect())
+        }
+    }
+
+    /// Apply range filters using IndexedMetadata.
+    fn apply_range_filters(
+        metadata_store: &dyn crate::storage::IndexedMetadata,
+        range_filters: &[RangeFilter],
+    ) -> Option<RoaringBitmap> {
+        use crate::payload::FilterQuery;
+
+        if range_filters.is_empty() {
+            return None;
+        }
+
+        let queries: Vec<FilterQuery> = range_filters
+            .iter()
+            .map(|rf| rf.to_filter_query())
+            .collect();
+
+        let combined = if queries.len() == 1 {
+            queries.into_iter().next().unwrap()
+        } else {
+            FilterQuery::and(queries)
+        };
+
+        metadata_store.filter(&combined)
     }
 
     /// Get query planner reference.

@@ -22,6 +22,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::num::NonZeroUsize;
 
+use std::sync::Arc;
+
 use lru::LruCache;
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
@@ -30,9 +32,9 @@ use roaring::RoaringBitmap;
 /// Vector of sorted (field, value) pairs for consistent hashing.
 pub type FilterCacheKey = Vec<(String, String)>;
 
-/// LRU cache for filter bitmaps.
+/// LRU cache for filter bitmaps (Arc-wrapped to avoid cloning).
 pub struct FilterBitmapCache {
-    cache: RwLock<LruCache<FilterCacheKey, RoaringBitmap>>,
+    cache: RwLock<LruCache<FilterCacheKey, Arc<RoaringBitmap>>>,
     hits: AtomicU64,
     misses: AtomicU64,
     invalidations: AtomicU64,
@@ -61,12 +63,12 @@ impl FilterBitmapCache {
         key
     }
 
-    /// Get cached bitmap for filter conditions.
-    pub fn get(&self, key: &FilterCacheKey) -> Option<RoaringBitmap> {
+    /// Get cached bitmap for filter conditions (Arc pointer copy, no bitmap clone).
+    pub fn get(&self, key: &FilterCacheKey) -> Option<Arc<RoaringBitmap>> {
         let mut cache = self.cache.write();
         if let Some(bitmap) = cache.get(key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(bitmap.clone())
+            Some(Arc::clone(bitmap))
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
             None
@@ -75,7 +77,7 @@ impl FilterBitmapCache {
 
     /// Put computed bitmap into cache.
     pub fn put(&self, key: FilterCacheKey, bitmap: RoaringBitmap) {
-        self.cache.write().put(key, bitmap);
+        self.cache.write().put(key, Arc::new(bitmap));
     }
 
     /// Invalidate entries containing a specific field.

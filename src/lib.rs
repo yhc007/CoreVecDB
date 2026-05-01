@@ -1,8 +1,10 @@
+#[cfg(feature = "server")]
 pub mod api;
 pub mod cache;
 pub mod collection;
 pub mod config;
 pub mod diskann;
+pub mod embedded;
 pub mod gpu;
 pub mod hnswpp;
 pub mod index;
@@ -10,6 +12,7 @@ pub mod ivfpq;
 pub mod metrics;
 pub mod navix;
 pub mod payload;
+#[cfg(feature = "server")]
 pub mod proto;
 pub mod quantization;
 pub mod query;

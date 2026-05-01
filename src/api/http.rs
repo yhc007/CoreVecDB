@@ -94,6 +94,24 @@ impl RangeFilter {
             }
         }
     }
+
+    /// Convert HTTP RangeFilter to collection-level RangeFilter.
+    fn to_collection_range_filter(&self) -> crate::collection::RangeFilter {
+        match self {
+            RangeFilter::Gt { field, value } =>
+                crate::collection::RangeFilter::Gt { field: field.clone(), value: *value },
+            RangeFilter::Gte { field, value } =>
+                crate::collection::RangeFilter::Gte { field: field.clone(), value: *value },
+            RangeFilter::Lt { field, value } =>
+                crate::collection::RangeFilter::Lt { field: field.clone(), value: *value },
+            RangeFilter::Lte { field, value } =>
+                crate::collection::RangeFilter::Lte { field: field.clone(), value: *value },
+            RangeFilter::Range { field, min, max } =>
+                crate::collection::RangeFilter::Range { field: field.clone(), min: *min, max: *max },
+            RangeFilter::Between { field, min, max } =>
+                crate::collection::RangeFilter::Between { field: field.clone(), min: *min, max: *max },
+        }
+    }
 }
 
 /// Apply range filters using IndexedMetadata.
@@ -791,10 +809,12 @@ async fn collection_search(
     Path(name): Path<String>,
     Json(payload): Json<JsonSearchReq>,
 ) -> Result<Json<JsonSearchResp>, StatusCode> {
+    use crate::collection::{SearchParams, SearchResult};
+
     let collection = state.manager.get(&name)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Check query cache first (if no metadata post-filtering needed)
+    // Check query cache first (HTTP-level caching by vector+k)
     let cache_key = QueryCacheKey::new(
         &name,
         &payload.vector,
@@ -802,8 +822,6 @@ async fn collection_search(
         Some(&payload.filter),
     );
     let current_vector_count = collection.len();
-
-    // Only use cache if no range filters, filter_ids, or filter_id_range (complex filters)
     let use_cache = payload.range_filters.is_empty()
         && payload.filter_ids.is_none()
         && payload.filter_id_range.is_none();
@@ -811,7 +829,6 @@ async fn collection_search(
     if use_cache {
         if let Some(ref query_cache) = collection.query_cache() {
             if let Some(cached_results) = query_cache.get(&cache_key, current_vector_count) {
-                // Cache hit - return cached results
                 let include_meta = payload.include_metadata;
                 let final_results: Vec<JsonSearchResult> = cached_results
                     .into_iter()
@@ -829,154 +846,36 @@ async fn collection_search(
         }
     }
 
-    // Build filter bitmap
-    let mut filter_bitmap: Option<roaring::RoaringBitmap> = None;
-
-    // 1. String field filters (exact match) - with filter cache
-    let has_metadata_filter = !payload.filter.is_empty();
-    let used_index_filter = if has_metadata_filter {
-        // Use query planner to optimize filter order (most selective first)
-        let filter_plan = collection.plan_filters(
-            payload.filter.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
-        );
-
-        // Build conditions in optimized order
-        let conditions: Vec<(&str, &str)> = filter_plan.filters
-            .iter()
-            .map(|f| (f.field.as_str(), f.value.as_str()))
-            .collect();
-
-        // Try filter cache first
-        let filter_cache_key = FilterBitmapCache::normalize_key(&conditions);
-
-        if let Some(ref filter_cache) = collection.filter_cache() {
-            if let Some(cached_bitmap) = filter_cache.get(&filter_cache_key) {
-                filter_bitmap = Some(cached_bitmap);
-                true
-            } else if let Some(indexed_bitmap) = collection.metadata_store.try_filter_and(&conditions) {
-                // Cache the computed bitmap
-                filter_cache.put(filter_cache_key, indexed_bitmap.clone());
-                filter_bitmap = Some(indexed_bitmap);
-                true
-            } else {
-                false
-            }
-        } else if let Some(indexed_bitmap) = collection.metadata_store.try_filter_and(&conditions) {
-            filter_bitmap = Some(indexed_bitmap);
-            true
-        } else {
-            false
-        }
-    } else {
-        false
+    // Delegate to Collection::search() for filter construction + search + post-filter
+    let params = SearchParams {
+        vector: payload.vector,
+        k: payload.k as usize,
+        filter: payload.filter.into_iter().collect(),
+        range_filters: payload.range_filters.iter().map(|rf| rf.to_collection_range_filter()).collect(),
+        filter_ids: payload.filter_ids,
+        filter_id_range: payload.filter_id_range,
+        include_metadata: payload.include_metadata,
     };
 
-    // 2. Range filters (numeric fields)
-    let has_range_filter = !payload.range_filters.is_empty();
-    if has_range_filter {
-        // Try to downcast to IndexedMetadata for range filter support
-        // IndexedSledMetadataStore implements IndexedMetadata trait
-        if let Some(indexed_store) = collection.metadata_store
-            .as_any()
-            .and_then(|any| any.downcast_ref::<crate::storage::IndexedSledMetadataStore>())
-        {
-            if let Some(range_bitmap) = apply_range_filters(indexed_store, &payload.range_filters) {
-                filter_bitmap = Some(
-                    filter_bitmap
-                        .map(|existing| existing & &range_bitmap)
-                        .unwrap_or(range_bitmap)
-                );
-            }
-        }
-    }
-
-    // 3. ID range filter
-    if let Some((start, end)) = payload.filter_id_range {
-        let range_bitmap = create_range_bitmap(start, end);
-        filter_bitmap = Some(
-            filter_bitmap
-                .map(|existing| existing & &range_bitmap)
-                .unwrap_or(range_bitmap)
-        );
-    }
-
-    // 4. Explicit ID filter
-    if let Some(ref ids) = payload.filter_ids {
-        if !ids.is_empty() {
-            let id_bitmap = create_filter_bitmap(ids);
-            filter_bitmap = Some(
-                filter_bitmap
-                    .map(|existing| existing & &id_bitmap)
-                    .unwrap_or(id_bitmap)
-            );
-        }
-    }
-
-    // 5. Exclude deleted vectors (using cached active bitmap)
-    if let Some(active_bitmap) = collection.active_bitmap() {
-        filter_bitmap = Some(
-            filter_bitmap
-                .map(|existing| existing & &active_bitmap)
-                .unwrap_or(active_bitmap)
-        );
-    }
-
-    let results = collection.adaptive_search(&payload.vector, payload.k as usize, filter_bitmap.as_ref())
+    let results = collection.search(params)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let include_meta = payload.include_metadata;
-
-    let final_results: Vec<JsonSearchResult> = if has_metadata_filter && !used_index_filter {
-        // Batch post-filter: fetch all filter fields at once instead of per-result lookups
-        let result_ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
-        let mut passing_ids = std::collections::HashSet::with_capacity(result_ids.len());
-        passing_ids.extend(result_ids.iter().copied());
-
-        for (fk, fv) in &payload.filter {
-            if let Ok(batch) = collection.metadata_store.get_batch(&result_ids, fk) {
-                passing_ids.retain(|id| {
-                    batch.get(id).map(|v| v == fv).unwrap_or(false)
-                });
-            } else {
-                passing_ids.clear();
-            }
-            if passing_ids.is_empty() {
-                break;
-            }
+    // Store in query cache (simple queries only)
+    if use_cache && !results.is_empty() {
+        if let Some(ref query_cache) = collection.query_cache() {
+            let cache_results: Vec<(u64, f32)> = results.iter().map(|r| (r.id, r.score)).collect();
+            query_cache.put(cache_key, cache_results, current_vector_count);
         }
+    }
 
-        results
-            .into_iter()
-            .filter(|(id, _)| passing_ids.contains(id))
-            .map(|(id, score)| {
-                let metadata = if include_meta {
-                    Some(collection.metadata_store.get_all(id))
-                } else {
-                    None
-                };
-                JsonSearchResult { id, score, metadata }
-            })
-            .collect()
-    } else {
-        // Store results in query cache (only for simple queries without post-filtering)
-        if use_cache {
-            if let Some(ref query_cache) = collection.query_cache() {
-                query_cache.put(cache_key, results.clone(), current_vector_count);
-            }
-        }
-
-        results
-            .into_iter()
-            .map(|(id, score)| {
-                let metadata = if include_meta {
-                    Some(collection.metadata_store.get_all(id))
-                } else {
-                    None
-                };
-                JsonSearchResult { id, score, metadata }
-            })
-            .collect()
-    };
+    let final_results: Vec<JsonSearchResult> = results
+        .into_iter()
+        .map(|r| JsonSearchResult {
+            id: r.id,
+            score: r.score,
+            metadata: r.metadata,
+        })
+        .collect();
 
     Ok(Json(JsonSearchResp { results: final_results }))
 }
