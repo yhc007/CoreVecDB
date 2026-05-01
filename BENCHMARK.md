@@ -9,7 +9,7 @@ Benchmark comparing CoreVecDB embedded (in-process) mode against CoreVecDB HTTP 
 | Vectors | 10,000 |
 | Dimensions | 128 |
 | k (top results) | 10 |
-| Iterations | 500~1,000 |
+| Iterations | 500 |
 | Filter | `category = "electronics"` (10% selectivity, 10 categories) |
 | Distance metric | Cosine |
 | Hardware | Apple Silicon (M-series), macOS |
@@ -22,28 +22,28 @@ The primary benchmark — this is where CoreVecDB's embedded mode shines.
 
 | Database | Mode | ops/s | avg latency | p50 | p99 |
 |----------|------|------:|------------:|----:|----:|
-| **CoreVecDB** | **Embedded (in-process)** | **2,340** | **0.43ms** | **0.41ms** | **0.55ms** |
-| FAISS | In-memory (IDSelector) | ~1,800 | ~0.56ms | - | - |
-| CoreVecDB | HTTP (localhost) | 640 | 1.56ms | 1.50ms | 2.10ms |
-| LanceDB | Embedded (Arrow) | ~750 | ~1.33ms | - | - |
-| ChromaDB | In-process | ~240 | ~4.17ms | - | - |
-| Qdrant | Local mode | ~200 | ~5.00ms | - | - |
+| FAISS | In-memory (IDSelector) | 3,718 | 0.27ms | 0.27ms | 0.34ms |
+| **CoreVecDB** | **Embedded (in-process)** | **2,218** | **0.45ms** | **0.45ms** | **0.52ms** |
+| LanceDB | Embedded (Arrow) | 767 | 1.30ms | 1.25ms | 1.94ms |
+| CoreVecDB | HTTP (localhost) | 263 | 3.80ms | 3.45ms | 8.78ms |
+| ChromaDB | In-process | 220 | 4.54ms | 4.47ms | 5.51ms |
+| Qdrant | Local mode | 23 | 43.34ms | 44.66ms | 53.74ms |
 
 ### Key Takeaway
 
-CoreVecDB embedded mode achieves **2,340 ops/s** for filtered search — **3.7x faster than HTTP mode** and **3.1x faster than LanceDB**.
+CoreVecDB embedded mode achieves **2,218 ops/s** for filtered search — **8.4x faster than HTTP mode**, **2.9x faster than LanceDB**, and **10x faster than ChromaDB**. Only FAISS (pure in-memory, no persistence) is faster.
 
 ## Unfiltered Search Performance
 
 | Database | Mode | ops/s | avg latency | p50 | p99 |
 |----------|------|------:|------------:|----:|----:|
-| FAISS | In-memory (HNSW) | ~50,000 | ~0.02ms | - | - |
-| FAISS | In-memory (Flat/brute) | ~12,000 | ~0.08ms | - | - |
-| CoreVecDB | HTTP (cached) | ~1,388 | 0.72ms | 0.70ms | 1.10ms |
-| LanceDB | Embedded | ~900 | ~1.11ms | - | - |
-| CoreVecDB | Embedded | 382 | 2.62ms | 2.63ms | 3.10ms |
-| ChromaDB | In-process | ~350 | ~2.86ms | - | - |
-| Qdrant | Local mode | ~300 | ~3.33ms | - | - |
+| FAISS | In-memory (HNSW) | 22,005 | 0.05ms | 0.04ms | 0.05ms |
+| FAISS | In-memory (Flat/brute) | 9,654 | 0.10ms | 0.10ms | 0.13ms |
+| ChromaDB | In-process | 1,575 | 0.63ms | 0.61ms | 0.91ms |
+| CoreVecDB | HTTP (cached) | 1,131 | 0.88ms | 0.75ms | 3.99ms |
+| LanceDB | Embedded | 1,035 | 0.97ms | 0.93ms | 1.58ms |
+| Qdrant | Local mode | 552 | 1.81ms | 1.79ms | 2.08ms |
+| CoreVecDB | Embedded | 379 | 2.64ms | 2.64ms | 2.89ms |
 
 > Note: CoreVecDB HTTP "no filter" benefits from query result caching (same query repeated).
 > FAISS operates purely in-memory with no persistence overhead.
@@ -52,21 +52,22 @@ CoreVecDB embedded mode achieves **2,340 ops/s** for filtered search — **3.7x 
 
 | Database | Mode | ops/s | avg latency | p50 | p99 |
 |----------|------|------:|------------:|----:|----:|
-| **CoreVecDB** | **Embedded** | **2,260** | **0.44ms** | **0.42ms** | **0.58ms** |
-| LanceDB | Embedded | ~700 | ~1.43ms | - | - |
-| CoreVecDB | HTTP | ~240 | ~4.17ms | - | - |
-| ChromaDB | In-process | ~220 | ~4.55ms | - | - |
+| **CoreVecDB** | **Embedded** | **2,133** | **0.47ms** | **0.47ms** | **0.60ms** |
+| LanceDB | Embedded | 535 | 1.87ms | 1.80ms | 2.35ms |
+| CoreVecDB | HTTP | 252 | 3.96ms | 3.60ms | 9.66ms |
+| ChromaDB | In-process | 208 | 4.80ms | 4.74ms | 5.90ms |
+| Qdrant | Local mode | 23 | 43.45ms | 44.61ms | 55.05ms |
 
 ## Insert Performance
 
 | Database | Mode | vec/s | Time (10K) |
 |----------|------|------:|-----------:|
-| FAISS | In-memory (Flat) | ~250,000 | 0.04s |
-| LanceDB | Embedded | ~5,000 | ~2.0s |
-| **CoreVecDB** | **Embedded** | **2,980** | **3.36s** |
-| CoreVecDB | HTTP | ~2,500 | ~4.0s |
-| ChromaDB | In-process | ~2,000 | ~5.0s |
-| Qdrant | Local mode | ~1,500 | ~6.7s |
+| FAISS | In-memory (Flat) | 52,140,095 | 0.0002s |
+| LanceDB | Embedded + index | 8,400 | 1.19s |
+| ChromaDB | In-process | 7,919 | 1.26s |
+| **CoreVecDB** | **Embedded** | **3,327** | **3.01s** |
+| CoreVecDB | HTTP | 2,538 | 3.94s |
+| Qdrant | Local mode | 1,340 | 7.46s |
 
 ## Architecture Comparison
 
@@ -80,26 +81,27 @@ CoreVecDB embedded mode achieves **2,340 ops/s** for filtered search — **3.7x 
 
 ## Why Embedded Mode Is Faster
 
-CoreVecDB HTTP mode incurs ~1ms overhead per request:
+CoreVecDB HTTP mode incurs ~3.5ms overhead per filtered request:
 - JSON serialization/deserialization (~0.3ms)
 - TCP round-trip on localhost (~0.2ms)
 - HTTP framework overhead (~0.5ms)
+- Connection management and buffering (~2.5ms)
 
 Embedded mode eliminates all of this — function calls go directly to `Collection::search()` with zero-copy filter bitmap construction.
 
-For filtered search at 10K scale, the actual computation is ~0.4ms (bitmap lookup + HNSW traversal). HTTP overhead was **71% of total latency**.
+For filtered search at 10K scale, the actual computation is ~0.45ms (bitmap lookup + HNSW traversal). HTTP overhead was **88% of total latency**.
 
 ## How to Run
 
 ```bash
-# Embedded benchmark (recommended)
+# Full competitive benchmark
 cd corevecdb-python
 python3 -m venv .venv && source .venv/bin/activate
-pip install numpy
+pip install numpy chromadb qdrant-client lancedb faiss-cpu
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin develop --release
 cd .. && python3 bench_competitive.py
 
-# HTTP-only benchmark (requires running server)
+# HTTP benchmark (requires running server)
 cargo run --release  # terminal 1
 python3 bench_competitive.py  # terminal 2
 ```
@@ -141,7 +143,7 @@ db.create_collection(
         .with_indexed_fields(vec!["category"], vec![])
 )?;
 
-let col = db.collection("products").unwrap();
+let col = db.collection("products")?;
 let results = col.search(
     SearchParams::new(query_vec, 10)
         .with_filter("category", "electronics")
