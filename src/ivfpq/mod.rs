@@ -38,6 +38,9 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "candle")]
+use candle_core::{Device, Tensor};
+
 // =============================================================================
 // IVF-PQ Configuration
 // =============================================================================
@@ -142,6 +145,66 @@ pub struct CoarseQuantizer {
     trained: bool,
 }
 
+// =============================================================================
+// Candle GPU K-Means Acceleration
+// =============================================================================
+
+/// GPU-accelerated k-means assignment using candle tensor matmul.
+///
+/// Computes all-pairs L2 distances via:
+///   dist(v, c) = ||v||² + ||c||² - 2·v·cᵀ
+///
+/// Returns assignment vector (one cluster index per input vector).
+#[cfg(feature = "candle")]
+fn candle_kmeans_assign(
+    vectors_tensor: &Tensor,    // [n, dim] on device
+    vectors_sq_norms: &Tensor,  // [n, 1] precomputed
+    centroids: &[Vec<f32>],
+    device: &Device,
+) -> Result<Vec<usize>> {
+    let k = centroids.len();
+    let dim = centroids[0].len();
+
+    // Build centroids tensor
+    let c_flat: Vec<f32> = centroids.iter().flat_map(|c| c.iter().copied()).collect();
+    let c_tensor = Tensor::from_vec(c_flat, (k, dim), device)?;
+
+    // ||c||² → [1, k]
+    let c_sq = c_tensor.sqr()?.sum_keepdim(1)?.t()?; // [1, k]
+
+    // V · Cᵀ → [n, k]
+    let dots = vectors_tensor.matmul(&c_tensor.t()?)?;
+
+    // distances = ||v||² + ||c||² - 2·dot   →  [n, k]
+    let two = Tensor::from_vec(vec![2.0f32], 1, device)?;
+    let distances = vectors_sq_norms
+        .broadcast_add(&c_sq)?
+        .broadcast_sub(&dots.broadcast_mul(&two)?)?;
+
+    // argmin per row → assignment
+    let assignments = distances.argmin(1)?; // [n]  (u32 indices)
+    let assignments = assignments.to_vec1::<u32>()?;
+    Ok(assignments.into_iter().map(|a| a as usize).collect())
+}
+
+/// Resolve the best available candle device for k-means.
+#[cfg(feature = "candle")]
+fn candle_kmeans_device() -> Device {
+    #[cfg(feature = "candle-metal")]
+    {
+        if let Ok(d) = Device::new_metal(0) {
+            return d;
+        }
+    }
+    #[cfg(feature = "candle-cuda")]
+    {
+        if let Ok(d) = Device::new_cuda(0) {
+            return d;
+        }
+    }
+    Device::Cpu
+}
+
 impl CoarseQuantizer {
     /// Create a new coarse quantizer.
     pub fn new(nlist: usize, dim: usize) -> Self {
@@ -154,6 +217,9 @@ impl CoarseQuantizer {
     }
 
     /// Train the coarse quantizer using k-means.
+    ///
+    /// When the `candle` feature is enabled, the assignment step uses
+    /// GPU-accelerated matmul (Metal/CUDA/CPU tensor ops).
     pub fn train(&mut self, vectors: &[Vec<f32>], iterations: usize) -> Result<()> {
         if vectors.is_empty() {
             return Err(anyhow::anyhow!("Cannot train with empty dataset"));
@@ -169,9 +235,23 @@ impl CoarseQuantizer {
             centroids.push(vectors[i * step].clone());
         }
 
+        // Precompute tensors for GPU path
+        #[cfg(feature = "candle")]
+        let (device, v_tensor, v_sq) = {
+            let device = candle_kmeans_device();
+            let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+            let v_tensor = Tensor::from_vec(flat, (n, self.dim), &device)?;
+            let v_sq = v_tensor.sqr()?.sum_keepdim(1)?; // [n, 1]
+            (device, v_tensor, v_sq)
+        };
+
         // K-means iterations
         for _ in 0..iterations {
             // Assign vectors to nearest centroid
+            #[cfg(feature = "candle")]
+            let assignments = candle_kmeans_assign(&v_tensor, &v_sq, &centroids, &device)?;
+
+            #[cfg(not(feature = "candle"))]
             let assignments: Vec<usize> = vectors
                 .par_iter()
                 .map(|v| self.find_nearest_centroid(v, &centroids))
@@ -279,6 +359,8 @@ impl PqCodebook {
     }
 
     /// Train the codebook using k-means.
+    ///
+    /// When `candle` feature is enabled, uses GPU-accelerated assignment.
     pub fn train(&mut self, subvectors: &[Vec<f32>], iterations: usize) {
         if subvectors.is_empty() {
             return;
@@ -294,8 +376,34 @@ impl PqCodebook {
             centroids.push(subvectors[(i * step) % n].clone());
         }
 
+        // Precompute tensors for GPU path (only worthwhile for large datasets)
+        #[cfg(feature = "candle")]
+        let gpu_ctx = if n >= 1000 {
+            let device = candle_kmeans_device();
+            let flat: Vec<f32> = subvectors.iter().flat_map(|v| v.iter().copied()).collect();
+            Tensor::from_vec(flat, (n, self.subvector_dim), &device)
+                .and_then(|v_tensor| {
+                    let v_sq = v_tensor.sqr()?.sum_keepdim(1)?;
+                    Ok((device, v_tensor, v_sq))
+                })
+                .ok()
+        } else {
+            None
+        };
+
         // K-means
         for _ in 0..iterations {
+            #[cfg(feature = "candle")]
+            let assignments: Vec<usize> = if let Some((ref device, ref v_tensor, ref v_sq)) = gpu_ctx {
+                candle_kmeans_assign(v_tensor, v_sq, &centroids, device)
+                    .unwrap_or_else(|_| {
+                        subvectors.iter().map(|sv| self.find_nearest(&centroids, sv)).collect()
+                    })
+            } else {
+                subvectors.iter().map(|sv| self.find_nearest(&centroids, sv)).collect()
+            };
+
+            #[cfg(not(feature = "candle"))]
             let assignments: Vec<usize> = subvectors
                 .iter()
                 .map(|sv| self.find_nearest(&centroids, sv))

@@ -235,6 +235,75 @@ impl CollectionHandle {
             .flush()
             .map_err(|e| PyValueError::new_err(format!("Flush failed: {}", e)))
     }
+
+    /// Insert a text document (embeds it first, stores text in _text metadata).
+    /// Requires candle feature.
+    #[cfg(feature = "candle")]
+    #[pyo3(signature = (text, edb, metadata=None))]
+    fn insert_text(
+        &self,
+        text: &str,
+        edb: &EmbeddingDB,
+        metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<u64> {
+        let meta: Vec<(&str, &str)> = metadata
+            .as_ref()
+            .map(|m| m.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect())
+            .unwrap_or_default();
+        self.inner
+            .insert_text(text, &edb.inner, &meta)
+            .map_err(|e| PyValueError::new_err(format!("Insert text failed: {}", e)))
+    }
+
+    /// Search by text query (embeds query, then vector search).
+    /// Requires candle feature.
+    #[cfg(feature = "candle")]
+    #[pyo3(signature = (query, edb, k=10))]
+    fn search_text(
+        &self,
+        query: &str,
+        edb: &EmbeddingDB,
+        k: usize,
+    ) -> PyResult<Vec<PySearchResult>> {
+        let results = self.inner
+            .search_text(query, &edb.inner, k)
+            .map_err(|e| PyValueError::new_err(format!("Search text failed: {}", e)))?;
+
+        Ok(results
+            .into_iter()
+            .map(|r| PySearchResult {
+                id: r.id,
+                score: r.score,
+                metadata: r.metadata,
+            })
+            .collect())
+    }
+
+    /// Hybrid text + vector search.
+    /// Requires candle feature.
+    #[cfg(feature = "candle")]
+    #[pyo3(signature = (query, edb, k=10, alpha=0.5))]
+    fn hybrid_search_text(
+        &self,
+        query: &str,
+        edb: &EmbeddingDB,
+        k: usize,
+        alpha: f32,
+    ) -> PyResult<Vec<PyHybridResult>> {
+        let results = self.inner
+            .hybrid_search_text(query, &edb.inner, k, alpha)
+            .map_err(|e| PyValueError::new_err(format!("Hybrid search text failed: {}", e)))?;
+
+        Ok(results
+            .into_iter()
+            .map(|r| PyHybridResult {
+                id: r.id,
+                combined_score: r.combined_score,
+                vector_score: r.vector_score,
+                text_score: r.text_score,
+            })
+            .collect())
+    }
 }
 
 /// Search result.
@@ -282,6 +351,101 @@ struct PyCollectionInfo {
     count: usize,
 }
 
+// ─── Candle Embedding API ───────────────────────────────────────────
+
+/// EmbeddingDB — CoreVecDB with in-process text embedding.
+///
+/// Downloads and caches a transformer model from HuggingFace Hub,
+/// then provides text-to-vector operations directly.
+///
+/// Example:
+///     edb = corevecdb.EmbeddingDB("./data", model="intfloat/e5-small-v2")
+///     edb.create_collection("docs")
+///     col = edb.collection("docs")
+///     col.insert_text("The quick brown fox", edb, metadata={"source": "test"})
+///     results = col.search_text("fast fox", edb, k=5)
+#[cfg(feature = "candle")]
+#[pyclass]
+struct EmbeddingDB {
+    inner: vectordb::embedded::EmbeddingDB,
+}
+
+#[cfg(feature = "candle")]
+#[pymethods]
+impl EmbeddingDB {
+    /// Open a database with an in-process embedder.
+    #[new]
+    #[pyo3(signature = (data_dir, model="intfloat/e5-small-v2"))]
+    fn new(data_dir: &str, model: &str) -> PyResult<Self> {
+        let inner = vectordb::embedded::EmbeddingDB::open(data_dir, model)
+            .map_err(|e| PyValueError::new_err(format!("Failed to open EmbeddingDB: {}", e)))?;
+        Ok(Self { inner })
+    }
+
+    /// Embed a single text into a vector.
+    fn embed(&self, text: &str) -> PyResult<Vec<f32>> {
+        self.inner
+            .embed(text)
+            .map_err(|e| PyValueError::new_err(format!("Embedding failed: {}", e)))
+    }
+
+    /// Embed a batch of texts.
+    fn embed_batch(&self, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        self.inner
+            .embed_batch(&refs)
+            .map_err(|e| PyValueError::new_err(format!("Batch embedding failed: {}", e)))
+    }
+
+    /// Get the embedding dimension.
+    #[getter]
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+
+    /// Create a collection with the embedder's dimension.
+    fn create_collection(&self, name: &str) -> PyResult<()> {
+        self.inner
+            .create_collection(name)
+            .map_err(|e| PyValueError::new_err(format!("Failed to create collection: {}", e)))
+    }
+
+    /// Get a collection handle.
+    fn collection(&self, name: &str) -> PyResult<CollectionHandle> {
+        self.inner
+            .collection(name)
+            .map(|h| CollectionHandle { inner: h })
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))
+    }
+
+    /// List all collections.
+    fn list_collections(&self) -> Vec<PyCollectionInfo> {
+        self.inner
+            .list_collections()
+            .into_iter()
+            .map(|c| PyCollectionInfo {
+                name: c.name,
+                dim: c.dim,
+                count: c.vector_count,
+            })
+            .collect()
+    }
+
+    /// Drop a collection.
+    fn drop_collection(&self, name: &str) -> PyResult<()> {
+        self.inner
+            .drop_collection(name)
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))
+    }
+
+    /// Flush all collections.
+    fn flush(&self) -> PyResult<()> {
+        self.inner
+            .flush()
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))
+    }
+}
+
 #[pymodule]
 fn corevecdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CoreVecDB>()?;
@@ -289,5 +453,7 @@ fn corevecdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySearchResult>()?;
     m.add_class::<PyHybridResult>()?;
     m.add_class::<PyCollectionInfo>()?;
+    #[cfg(feature = "candle")]
+    m.add_class::<EmbeddingDB>()?;
     Ok(())
 }

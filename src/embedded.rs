@@ -97,6 +97,219 @@ impl CoreVecDB {
     }
 }
 
+// ─── Candle embedding integration ───────────────────────────────────
+
+/// CoreVecDB with an in-process text embedder.
+///
+/// Wraps `CoreVecDB` + `CandleTextEmbedder` to provide text-to-vector
+/// operations directly (insert_text, search_text, etc.).
+#[cfg(feature = "candle")]
+pub struct EmbeddingDB {
+    db: CoreVecDB,
+    embedder: Arc<candle_embed::CandleTextEmbedder>,
+}
+
+#[cfg(feature = "candle")]
+impl EmbeddingDB {
+    /// Open a database with an in-process embedder.
+    ///
+    /// Downloads the model from HuggingFace Hub on first use.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let edb = EmbeddingDB::open("./data", "intfloat/e5-small-v2")?;
+    /// let col = edb.collection("docs")?;
+    /// col.insert_text("hello world", &edb, &[("source", "test")])?;
+    /// ```
+    pub fn open(
+        data_dir: impl AsRef<Path>,
+        model_id: &str,
+    ) -> Result<Self> {
+        let db = CoreVecDB::open(data_dir)?;
+        let config = candle_embed::EmbedderConfig::for_model(model_id);
+        let embedder = candle_embed::CandleTextEmbedder::new(config)
+            .map_err(|e| VecDbError::Internal(anyhow::anyhow!("failed to load model: {}", e)))?;
+        Ok(Self {
+            db,
+            embedder: Arc::new(embedder),
+        })
+    }
+
+    /// Open with a custom embedder config.
+    pub fn open_with_config(
+        data_dir: impl AsRef<Path>,
+        config: candle_embed::EmbedderConfig,
+    ) -> Result<Self> {
+        let db = CoreVecDB::open(data_dir)?;
+        let embedder = candle_embed::CandleTextEmbedder::new(config)
+            .map_err(|e| VecDbError::Internal(anyhow::anyhow!("failed to load model: {}", e)))?;
+        Ok(Self {
+            db,
+            embedder: Arc::new(embedder),
+        })
+    }
+
+    /// Get the underlying database.
+    pub fn db(&self) -> &CoreVecDB {
+        &self.db
+    }
+
+    /// Get the embedder.
+    pub fn embedder(&self) -> &candle_embed::CandleTextEmbedder {
+        &self.embedder
+    }
+
+    /// Embed a single text.
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        self.embedder
+            .embed(text)
+            .map_err(|e| VecDbError::Internal(anyhow::anyhow!("embedding failed: {}", e)))
+    }
+
+    /// Embed a batch of texts.
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.embedder
+            .embed_batch(texts)
+            .map_err(|e| VecDbError::Internal(anyhow::anyhow!("batch embedding failed: {}", e)))
+    }
+
+    /// Get the embedding dimension.
+    pub fn dimension(&self) -> usize {
+        self.embedder.dimension()
+    }
+
+    /// Get a collection handle.
+    pub fn collection(&self, name: &str) -> Result<CollectionHandle> {
+        self.db.collection(name)
+    }
+
+    /// Create a collection with the embedder's dimension.
+    pub fn create_collection(&self, name: &str) -> Result<()> {
+        let config = CollectionConfig::new(name, self.dimension());
+        self.db.create_collection(config)
+    }
+
+    /// Create a collection with custom config.
+    pub fn create_collection_with_config(&self, config: CollectionConfig) -> Result<()> {
+        self.db.create_collection(config)
+    }
+
+    /// List all collections.
+    pub fn list_collections(&self) -> Vec<CollectionInfo> {
+        self.db.list_collections()
+    }
+
+    /// Drop a collection.
+    pub fn drop_collection(&self, name: &str) -> Result<()> {
+        self.db.drop_collection(name)
+    }
+
+    /// Flush all collections to disk.
+    pub fn flush(&self) -> Result<()> {
+        self.db.flush()
+    }
+}
+
+// Text-based operations on CollectionHandle (requires EmbeddingDB)
+#[cfg(feature = "candle")]
+impl CollectionHandle {
+    /// Insert a text document by embedding it first.
+    ///
+    /// The text is stored as metadata under the key `_text`.
+    pub fn insert_text(
+        &self,
+        text: &str,
+        edb: &EmbeddingDB,
+        metadata: &[(&str, &str)],
+    ) -> Result<u64> {
+        let vector = edb.embed(text)?;
+        let mut meta: Vec<(&str, &str)> = metadata.to_vec();
+        meta.push(("_text", text));
+        self.insert(&vector, &meta)
+    }
+
+    /// Search by text query (embeds the query, then vector search).
+    pub fn search_text(
+        &self,
+        query: &str,
+        edb: &EmbeddingDB,
+        k: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let vector = edb.embed(query)?;
+        let params = SearchParams::new(vector, k).with_metadata();
+        self.search(params)
+    }
+
+    /// Hybrid text + vector search.
+    pub fn hybrid_search_text(
+        &self,
+        query: &str,
+        edb: &EmbeddingDB,
+        k: usize,
+        alpha: f32,
+    ) -> Result<Vec<HybridSearchResult>> {
+        let vector = edb.embed(query)?;
+        self.hybrid_search(&vector, query, k, alpha)
+    }
+
+    /// Search by text with cross-encoder reranking.
+    ///
+    /// Two-stage retrieval pipeline:
+    /// 1. Retrieve `top_k_initial` candidates via bi-encoder vector search
+    /// 2. Rerank candidates with the cross-encoder and return the top `top_k`
+    ///
+    /// The cross-encoder scores (query, document) pairs directly, producing
+    /// more accurate relevance scores than cosine similarity alone.
+    pub fn search_and_rerank(
+        &self,
+        query: &str,
+        edb: &EmbeddingDB,
+        top_k: usize,
+        top_k_initial: usize,
+        reranker: &candle_embed::CandleReranker,
+    ) -> Result<Vec<SearchResult>> {
+        // Stage 1: fast bi-encoder retrieval
+        let candidates = self.search_text(query, edb, top_k_initial)?;
+
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Extract text from _text metadata field
+        let doc_texts: Vec<String> = candidates
+            .iter()
+            .map(|r| {
+                r.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("_text").cloned())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        let doc_refs: Vec<&str> = doc_texts.iter().map(|s| s.as_str()).collect();
+
+        // Stage 2: cross-encoder reranking
+        let ranked = reranker
+            .rerank(query, &doc_refs, top_k)
+            .map_err(|e| VecDbError::Internal(anyhow::anyhow!("reranking failed: {}", e)))?;
+
+        // Build results in reranked order, using cross-encoder score
+        let results: Vec<SearchResult> = ranked
+            .into_iter()
+            .map(|(idx, score)| {
+                let orig = &candidates[idx];
+                SearchResult {
+                    id: orig.id,
+                    score,
+                    metadata: orig.metadata.clone(),
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+}
+
 /// Handle to a single collection with ergonomic API.
 #[derive(Clone)]
 pub struct CollectionHandle {

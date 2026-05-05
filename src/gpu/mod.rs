@@ -47,6 +47,9 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "candle")]
+use candle_core::{Device, Tensor};
+
 // =============================================================================
 // GPU Configuration
 // =============================================================================
@@ -89,6 +92,11 @@ impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             backend: GpuBackend::Auto,
+            // GPU has CPU→GPU transfer overhead, so only use for larger batches.
+            // With candle, 1000+ vectors is the break-even point.
+            #[cfg(feature = "candle")]
+            min_batch_size: 1000,
+            #[cfg(not(feature = "candle"))]
             min_batch_size: 100,
             max_batch_size: 100_000,
             cpu_threads: num_cpus::get(),
@@ -455,39 +463,157 @@ impl GpuAccelerator {
     }
 
     // =========================================================================
-    // Metal Implementations (macOS)
+    // Candle GPU Implementations (Metal / CUDA via candle tensors)
     // =========================================================================
 
-    #[cfg(target_os = "macos")]
+    #[cfg(feature = "candle")]
+    fn candle_device(&self) -> Result<Device> {
+        match self.capabilities.selected_backend {
+            GpuBackend::Metal => {
+                #[cfg(feature = "candle-metal")]
+                {
+                    Device::new_metal(0).map_err(|e| anyhow::anyhow!("Metal device: {}", e))
+                }
+                #[cfg(not(feature = "candle-metal"))]
+                {
+                    Ok(Device::Cpu)
+                }
+            }
+            GpuBackend::Cuda => {
+                #[cfg(feature = "candle-cuda")]
+                {
+                    Device::new_cuda(0).map_err(|e| anyhow::anyhow!("CUDA device: {}", e))
+                }
+                #[cfg(not(feature = "candle-cuda"))]
+                {
+                    Ok(Device::Cpu)
+                }
+            }
+            _ => Ok(Device::Cpu),
+        }
+    }
+
+    /// Flatten Vec<Vec<f32>> into a contiguous tensor [n, dim] on the target device.
+    #[cfg(feature = "candle")]
+    fn vectors_to_tensor(&self, vectors: &[Vec<f32>], device: &Device) -> Result<Tensor> {
+        let n = vectors.len();
+        let dim = vectors[0].len();
+        let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+        Tensor::from_vec(flat, (n, dim), device)
+            .map_err(|e| anyhow::anyhow!("tensor from vectors: {}", e))
+    }
+
+    /// Candle-accelerated batch L2 squared distance.
+    /// distance_i = ||q - v_i||² = ||q||² + ||v_i||² - 2·q·v_iᵀ
+    #[cfg(feature = "candle")]
+    fn candle_batch_l2(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
+        let device = self.candle_device()?;
+        let dim = query.len();
+        let n = vectors.len();
+
+        let q = Tensor::from_vec(query.to_vec(), (1, dim), &device)?;
+        let vecs = self.vectors_to_tensor(vectors, &device)?;
+
+        // ||q||²  (scalar, broadcast)
+        let q_sq = q.sqr()?.sum_keepdim(1)?; // [1, 1]
+
+        // ||v_i||²  per row
+        let v_sq = vecs.sqr()?.sum_keepdim(1)?; // [n, 1]
+
+        // q · Vᵀ  →  [1, n]
+        let dot = q.matmul(&vecs.t()?)?; // [1, n]
+
+        // distances = ||q||² + ||v||² - 2·dot  →  broadcast to [1, n]
+        let two = Tensor::from_vec(vec![2.0f32], 1, &device)?;
+        let distances = v_sq
+            .t()? // [1, n]
+            .broadcast_add(&q_sq)? // [1, n]
+            .broadcast_sub(&dot.broadcast_mul(&two)?)?; // [1, n]
+
+        let result = distances.squeeze(0)?.to_vec1::<f32>()?;
+        // Clamp negatives from floating point errors
+        Ok(result.into_iter().map(|d| d.max(0.0)).collect())
+    }
+
+    /// Candle-accelerated batch dot product.
+    #[cfg(feature = "candle")]
+    fn candle_batch_dot(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
+        let device = self.candle_device()?;
+        let dim = query.len();
+
+        let q = Tensor::from_vec(query.to_vec(), (1, dim), &device)?;
+        let vecs = self.vectors_to_tensor(vectors, &device)?;
+
+        // q · Vᵀ  →  [1, n]
+        let dots = q.matmul(&vecs.t()?)?;
+        Ok(dots.squeeze(0)?.to_vec1::<f32>()?)
+    }
+
+    /// Candle-accelerated batch cosine distance.
+    /// cosine_distance = 1 - (q·v) / (||q|| · ||v||)
+    #[cfg(feature = "candle")]
+    fn candle_batch_cosine(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
+        let device = self.candle_device()?;
+        let dim = query.len();
+
+        let q = Tensor::from_vec(query.to_vec(), (1, dim), &device)?;
+        let vecs = self.vectors_to_tensor(vectors, &device)?;
+
+        // Norms
+        let q_norm = q.sqr()?.sum_keepdim(1)?.sqrt()?; // [1, 1]
+        let v_norms = vecs.sqr()?.sum_keepdim(1)?.sqrt()?; // [n, 1]
+
+        // Dot products
+        let dots = q.matmul(&vecs.t()?)?; // [1, n]
+
+        // Normalize: dots / (q_norm * v_norms^T)
+        let norms_product = q_norm.broadcast_mul(&v_norms.t()?)?; // [1, n]
+        let epsilon = Tensor::from_vec(vec![1e-10f32], 1, &device)?;
+        let norms_clamped = norms_product.clamp(1e-10f32, f32::MAX)?;
+        let similarities = dots.broadcast_div(&norms_clamped)?;
+
+        // cosine_distance = 1 - similarity
+        let ones = Tensor::ones_like(&similarities)?;
+        let distances = ones.sub(&similarities)?;
+
+        Ok(distances.squeeze(0)?.to_vec1::<f32>()?)
+    }
+
+    // =========================================================================
+    // Metal Implementations
+    // =========================================================================
+
     fn metal_batch_l2(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
-        // Metal implementation would use metal-rs crate
-        // For now, fall back to CPU with SIMD
-        Ok(self.cpu_batch_l2(query, vectors))
+        #[cfg(feature = "candle")]
+        {
+            return self.candle_batch_l2(query, vectors);
+        }
+        #[cfg(not(feature = "candle"))]
+        {
+            Ok(self.cpu_batch_l2(query, vectors))
+        }
     }
 
-    #[cfg(not(target_os = "macos"))]
-    fn metal_batch_l2(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
-        Ok(self.cpu_batch_l2(query, vectors))
-    }
-
-    #[cfg(target_os = "macos")]
     fn metal_batch_dot(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
-        Ok(self.cpu_batch_dot(query, vectors))
+        #[cfg(feature = "candle")]
+        {
+            return self.candle_batch_dot(query, vectors);
+        }
+        #[cfg(not(feature = "candle"))]
+        {
+            Ok(self.cpu_batch_dot(query, vectors))
+        }
     }
 
-    #[cfg(not(target_os = "macos"))]
-    fn metal_batch_dot(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
-        Ok(self.cpu_batch_dot(query, vectors))
-    }
-
-    #[cfg(target_os = "macos")]
     fn metal_batch_cosine(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
-        Ok(self.cpu_batch_cosine(query, vectors))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn metal_batch_cosine(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
-        Ok(self.cpu_batch_cosine(query, vectors))
+        #[cfg(feature = "candle")]
+        {
+            return self.candle_batch_cosine(query, vectors);
+        }
+        #[cfg(not(feature = "candle"))]
+        {
+            Ok(self.cpu_batch_cosine(query, vectors))
+        }
     }
 
     // =========================================================================
@@ -495,17 +621,36 @@ impl GpuAccelerator {
     // =========================================================================
 
     fn cuda_batch_l2(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
-        // CUDA implementation would use cuda-sys or cudarc crate
-        // For now, fall back to CPU with SIMD
-        Ok(self.cpu_batch_l2(query, vectors))
+        #[cfg(feature = "candle")]
+        {
+            return self.candle_batch_l2(query, vectors);
+        }
+        #[cfg(not(feature = "candle"))]
+        {
+            Ok(self.cpu_batch_l2(query, vectors))
+        }
     }
 
     fn cuda_batch_dot(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
-        Ok(self.cpu_batch_dot(query, vectors))
+        #[cfg(feature = "candle")]
+        {
+            return self.candle_batch_dot(query, vectors);
+        }
+        #[cfg(not(feature = "candle"))]
+        {
+            Ok(self.cpu_batch_dot(query, vectors))
+        }
     }
 
     fn cuda_batch_cosine(&self, query: &[f32], vectors: &[Vec<f32>]) -> Result<Vec<f32>> {
-        Ok(self.cpu_batch_cosine(query, vectors))
+        #[cfg(feature = "candle")]
+        {
+            return self.candle_batch_cosine(query, vectors);
+        }
+        #[cfg(not(feature = "candle"))]
+        {
+            Ok(self.cpu_batch_cosine(query, vectors))
+        }
     }
 }
 
@@ -610,6 +755,235 @@ unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     }
 
     total
+}
+
+// =============================================================================
+// Cached GPU Accelerator
+// =============================================================================
+
+/// GPU accelerator with pre-cached vectors tensor for fast repeated searches.
+///
+/// Unlike `GpuAccelerator` which transfers all vectors to GPU on every call,
+/// `CachedGpuAccelerator` keeps vectors on GPU memory permanently. Only the
+/// query vector (1 x dim) is transferred per search, eliminating the dominant
+/// bottleneck of flatten + copy for the stored vectors.
+#[cfg(feature = "candle")]
+pub struct CachedGpuAccelerator {
+    /// Vectors tensor [n, dim] on GPU device
+    vectors_tensor: Tensor,
+    /// Pre-computed ||v_i||² [n, 1]
+    vectors_sq_norms: Tensor,
+    /// Vectors transposed [dim, n] - cached to avoid repeated transpose
+    vectors_t: Tensor,
+    /// Device (Metal/CUDA/CPU)
+    device: Device,
+    /// Vector count
+    n: usize,
+    /// Vector dimension
+    dim: usize,
+}
+
+// Tensor is Send+Sync in candle, so CachedGpuAccelerator is too.
+#[cfg(feature = "candle")]
+unsafe impl Send for CachedGpuAccelerator {}
+#[cfg(feature = "candle")]
+unsafe impl Sync for CachedGpuAccelerator {}
+
+#[cfg(feature = "candle")]
+impl CachedGpuAccelerator {
+    /// Resolve the best available device (Metal > CUDA > CPU).
+    fn resolve_device() -> Device {
+        #[cfg(feature = "candle-metal")]
+        {
+            if let Ok(d) = Device::new_metal(0) {
+                return d;
+            }
+        }
+        #[cfg(feature = "candle-cuda")]
+        {
+            if let Ok(d) = Device::new_cuda(0) {
+                return d;
+            }
+        }
+        Device::Cpu
+    }
+
+    /// Create from vectors using the best available device.
+    /// Transfers all data to GPU once.
+    pub fn new(vectors: &[Vec<f32>]) -> Result<Self> {
+        let device = Self::resolve_device();
+        Self::with_device(vectors, device)
+    }
+
+    /// Create with explicit device selection.
+    pub fn with_device(vectors: &[Vec<f32>], device: Device) -> Result<Self> {
+        if vectors.is_empty() {
+            return Err(anyhow::anyhow!("Cannot create CachedGpuAccelerator with empty vectors"));
+        }
+
+        let n = vectors.len();
+        let dim = vectors[0].len();
+
+        // Flatten Vec<Vec<f32>> into contiguous buffer and transfer to device once
+        let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+        let vectors_tensor = Tensor::from_vec(flat, (n, dim), &device)
+            .map_err(|e| anyhow::anyhow!("Failed to create vectors tensor: {}", e))?;
+
+        // Pre-compute ||v_i||² [n, 1]
+        let vectors_sq_norms = vectors_tensor
+            .sqr()
+            .and_then(|t| t.sum_keepdim(1))
+            .map_err(|e| anyhow::anyhow!("Failed to compute squared norms: {}", e))?;
+
+        // Pre-compute transpose [dim, n]
+        let vectors_t = vectors_tensor
+            .t()
+            .map_err(|e| anyhow::anyhow!("Failed to transpose vectors: {}", e))?;
+
+        Ok(Self {
+            vectors_tensor,
+            vectors_sq_norms,
+            vectors_t,
+            device,
+            n,
+            dim,
+        })
+    }
+
+    /// Batch L2 squared distance. Only query is transferred per call.
+    ///
+    /// dist_i = ||q||² + ||v_i||² - 2·q·v_iᵀ
+    pub fn batch_l2_distance(&self, query: &[f32]) -> Result<Vec<f32>> {
+        if query.len() != self.dim {
+            return Err(anyhow::anyhow!(
+                "Query dimension {} != cached dimension {}",
+                query.len(),
+                self.dim
+            ));
+        }
+
+        let q = Tensor::from_vec(query.to_vec(), (1, self.dim), &self.device)
+            .map_err(|e| anyhow::anyhow!("query tensor: {}", e))?;
+
+        // ||q||² [1, 1]
+        let q_sq = q.sqr()?.sum_keepdim(1)?;
+
+        // q · Vᵀ → [1, n]  (uses cached transpose)
+        let dot = q.matmul(&self.vectors_t)?;
+
+        // distances = ||v||²ᵀ + ||q||² - 2·dot → [1, n]
+        let two = Tensor::from_vec(vec![2.0f32], 1, &self.device)?;
+        let distances = self
+            .vectors_sq_norms
+            .t()?                           // [1, n]
+            .broadcast_add(&q_sq)?          // [1, n]
+            .broadcast_sub(&dot.broadcast_mul(&two)?)?; // [1, n]
+
+        let result = distances.squeeze(0)?.to_vec1::<f32>()?;
+        Ok(result.into_iter().map(|d| d.max(0.0)).collect())
+    }
+
+    /// Batch dot product. Only query is transferred per call.
+    pub fn batch_dot_product(&self, query: &[f32]) -> Result<Vec<f32>> {
+        if query.len() != self.dim {
+            return Err(anyhow::anyhow!(
+                "Query dimension {} != cached dimension {}",
+                query.len(),
+                self.dim
+            ));
+        }
+
+        let q = Tensor::from_vec(query.to_vec(), (1, self.dim), &self.device)
+            .map_err(|e| anyhow::anyhow!("query tensor: {}", e))?;
+
+        // q · Vᵀ → [1, n]
+        let dots = q.matmul(&self.vectors_t)?;
+        Ok(dots.squeeze(0)?.to_vec1::<f32>()?)
+    }
+
+    /// Batch cosine distance. Only query is transferred per call.
+    ///
+    /// cosine_distance = 1 - (q·v) / (||q|| · ||v||)
+    pub fn batch_cosine_distance(&self, query: &[f32]) -> Result<Vec<f32>> {
+        if query.len() != self.dim {
+            return Err(anyhow::anyhow!(
+                "Query dimension {} != cached dimension {}",
+                query.len(),
+                self.dim
+            ));
+        }
+
+        let q = Tensor::from_vec(query.to_vec(), (1, self.dim), &self.device)
+            .map_err(|e| anyhow::anyhow!("query tensor: {}", e))?;
+
+        // ||q|| [1, 1]
+        let q_norm = q.sqr()?.sum_keepdim(1)?.sqrt()?;
+
+        // ||v_i|| [n, 1] — derived from cached squared norms
+        let v_norms = self.vectors_sq_norms.sqrt()?;
+
+        // q · Vᵀ → [1, n]
+        let dots = q.matmul(&self.vectors_t)?;
+
+        // norm products [1, n]
+        let norms_product = q_norm.broadcast_mul(&v_norms.t()?)?;
+        let norms_clamped = norms_product.clamp(1e-10f32, f32::MAX)?;
+        let similarities = dots.broadcast_div(&norms_clamped)?;
+
+        // cosine_distance = 1 - similarity
+        let ones = Tensor::ones_like(&similarities)?;
+        let distances = ones.sub(&similarities)?;
+
+        Ok(distances.squeeze(0)?.to_vec1::<f32>()?)
+    }
+
+    /// K-NN search using cached vectors.
+    pub fn knn_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        metric: DistanceMetric,
+    ) -> Result<Vec<(usize, f32)>> {
+        let distances = match metric {
+            DistanceMetric::L2Squared => self.batch_l2_distance(query)?,
+            DistanceMetric::DotProduct => self.batch_dot_product(query)?,
+            DistanceMetric::Cosine => self.batch_cosine_distance(query)?,
+        };
+
+        let mut indexed: Vec<(usize, f32)> = distances.into_iter().enumerate().collect();
+
+        match metric {
+            DistanceMetric::DotProduct => {
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            }
+            _ => {
+                indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            }
+        }
+
+        indexed.truncate(k);
+        Ok(indexed)
+    }
+
+    /// Number of cached vectors.
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// Vector dimension.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Get the device.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
 }
 
 // =============================================================================
@@ -853,5 +1227,140 @@ mod tests {
 
         let distances = gpu.batch_l2_distance(&query, &vectors).unwrap();
         assert_eq!(distances.len(), 1000);
+    }
+
+    // =========================================================================
+    // CachedGpuAccelerator tests
+    // =========================================================================
+
+    #[cfg(feature = "candle")]
+    mod cached_tests {
+        use super::*;
+
+        #[test]
+        fn test_cached_creation() {
+            let vectors = vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ];
+            let cached = CachedGpuAccelerator::new(&vectors).unwrap();
+            assert_eq!(cached.len(), 3);
+            assert_eq!(cached.dim(), 3);
+            assert!(!cached.is_empty());
+        }
+
+        #[test]
+        fn test_cached_empty_vectors_error() {
+            let vectors: Vec<Vec<f32>> = vec![];
+            assert!(CachedGpuAccelerator::new(&vectors).is_err());
+        }
+
+        #[test]
+        fn test_cached_dimension_mismatch_error() {
+            let vectors = vec![vec![1.0, 0.0, 0.0]];
+            let cached = CachedGpuAccelerator::new(&vectors).unwrap();
+            // Wrong dimension query
+            assert!(cached.batch_l2_distance(&[1.0, 2.0]).is_err());
+            assert!(cached.batch_dot_product(&[1.0, 2.0]).is_err());
+            assert!(cached.batch_cosine_distance(&[1.0, 2.0]).is_err());
+        }
+
+        #[test]
+        fn test_cached_l2_distance() {
+            let vectors = vec![
+                vec![1.0, 0.0, 0.0, 0.0],  // distance from [1,0,0,0] = 0
+                vec![0.0, 1.0, 0.0, 0.0],  // distance = 2
+                vec![2.0, 0.0, 0.0, 0.0],  // distance = 1
+            ];
+            let cached = CachedGpuAccelerator::with_device(&vectors, Device::Cpu).unwrap();
+            let query = vec![1.0, 0.0, 0.0, 0.0];
+            let distances = cached.batch_l2_distance(&query).unwrap();
+
+            assert_eq!(distances.len(), 3);
+            assert!((distances[0] - 0.0).abs() < 1e-5);
+            assert!((distances[1] - 2.0).abs() < 1e-5);
+            assert!((distances[2] - 1.0).abs() < 1e-5);
+        }
+
+        #[test]
+        fn test_cached_dot_product() {
+            let vectors = vec![
+                vec![1.0, 0.0, 0.0],  // dot with [1,2,3] = 1
+                vec![0.0, 1.0, 0.0],  // dot = 2
+                vec![0.0, 0.0, 1.0],  // dot = 3
+            ];
+            let cached = CachedGpuAccelerator::with_device(&vectors, Device::Cpu).unwrap();
+            let query = vec![1.0, 2.0, 3.0];
+            let dots = cached.batch_dot_product(&query).unwrap();
+
+            assert_eq!(dots.len(), 3);
+            assert!((dots[0] - 1.0).abs() < 1e-5);
+            assert!((dots[1] - 2.0).abs() < 1e-5);
+            assert!((dots[2] - 3.0).abs() < 1e-5);
+        }
+
+        #[test]
+        fn test_cached_cosine_distance() {
+            let vectors = vec![
+                vec![1.0, 0.0, 0.0],   // cosine distance from [1,0,0] = 0
+                vec![-1.0, 0.0, 0.0],  // cosine distance = 2
+                vec![0.0, 1.0, 0.0],   // cosine distance = 1
+            ];
+            let cached = CachedGpuAccelerator::with_device(&vectors, Device::Cpu).unwrap();
+            let query = vec![1.0, 0.0, 0.0];
+            let distances = cached.batch_cosine_distance(&query).unwrap();
+
+            assert_eq!(distances.len(), 3);
+            assert!(distances[0].abs() < 0.01);
+            assert!((distances[1] - 2.0).abs() < 0.01);
+            assert!((distances[2] - 1.0).abs() < 0.01);
+        }
+
+        #[test]
+        fn test_cached_knn_search() {
+            let vectors = random_vectors(100, 8);
+            let cached = CachedGpuAccelerator::with_device(&vectors, Device::Cpu).unwrap();
+            let query = vec![0.0; 8];
+
+            let results = cached.knn_search(&query, 5, DistanceMetric::L2Squared).unwrap();
+            assert_eq!(results.len(), 5);
+
+            // Results should be sorted by distance (ascending for L2)
+            for i in 1..results.len() {
+                assert!(results[i - 1].1 <= results[i].1);
+            }
+        }
+
+        #[test]
+        fn test_cached_repeated_queries() {
+            // The whole point: multiple queries against the same cached vectors
+            let vectors = random_vectors(500, 32);
+            let cached = CachedGpuAccelerator::with_device(&vectors, Device::Cpu).unwrap();
+
+            for _ in 0..10 {
+                let query: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+                let distances = cached.batch_l2_distance(&query).unwrap();
+                assert_eq!(distances.len(), 500);
+            }
+        }
+
+        #[test]
+        fn test_cached_matches_uncached() {
+            // Verify cached and uncached produce the same results
+            let vectors = random_vectors(200, 16);
+            let query: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
+
+            let gpu = GpuAccelerator::new(GpuConfig::cpu_only()).unwrap();
+            let uncached_l2 = gpu.batch_l2_distance(&query, &vectors).unwrap();
+
+            let cached = CachedGpuAccelerator::with_device(&vectors, Device::Cpu).unwrap();
+            let cached_l2 = cached.batch_l2_distance(&query).unwrap();
+
+            assert_eq!(uncached_l2.len(), cached_l2.len());
+            for (u, c) in uncached_l2.iter().zip(cached_l2.iter()) {
+                assert!((u - c).abs() < 1e-4, "uncached={} cached={}", u, c);
+            }
+        }
     }
 }
