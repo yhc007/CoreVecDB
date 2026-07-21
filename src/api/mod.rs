@@ -191,16 +191,11 @@ impl VectorService for VectorServiceImpl {
 
         let vec = req.vector.ok_or_else(|| Status::invalid_argument("Missing vector"))?;
 
-        let internal_id = collection.vector_store.insert(&vec.elements)
-            .map_err(|e| Status::internal(format!("Storage error: {}", e)))?;
-
-        collection.indexer.insert(internal_id, &vec.elements)
-            .map_err(|e| Status::internal(format!("Index error: {}", e)))?;
-
-        for (k, v) in req.metadata {
-            collection.metadata_store.insert(internal_id, k, v)
-                .map_err(|e| Status::internal(format!("Metadata error: {}", e)))?;
-        }
+        // Shared engine path: cosine normalization, text/payload indexing, WAL,
+        // planner stats, and cache invalidation (previously all skipped here).
+        let meta: Vec<(String, String)> = req.metadata.into_iter().collect();
+        let internal_id = collection.insert(&vec.elements, &meta)
+            .map_err(|e| Status::internal(format!("Insert error: {}", e)))?;
 
         Ok(Response::new(UpsertResponse {
             id: internal_id,
@@ -223,40 +218,19 @@ impl VectorService for VectorServiceImpl {
             }));
         }
 
-        let vectors: Vec<Vec<f32>> = req.vectors
-            .iter()
-            .filter_map(|bv| bv.vector.as_ref().map(|v| v.elements.clone()))
-            .collect();
-
-        let start_id = collection.vector_store.insert_batch(&vectors)
-            .map_err(|e| Status::internal(format!("Storage error: {}", e)))?;
-
-        let index_data: Vec<(u64, Vec<f32>)> = vectors
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| (start_id + i as u64, v))
-            .collect();
-
-        collection.indexer.insert_batch(&index_data)
-            .map_err(|e| Status::internal(format!("Index error: {}", e)))?;
-
-        let metadata_entries: Vec<MetadataEntry> = req.vectors
-            .iter()
-            .enumerate()
-            .flat_map(|(i, bv)| {
-                let id = start_id + i as u64;
-                bv.metadata.iter().map(move |(k, v)| MetadataEntry {
-                    id,
-                    key: k.clone(),
-                    value: v.clone(),
-                })
-            })
-            .collect();
-
-        if !metadata_entries.is_empty() {
-            collection.metadata_store.insert_batch(&metadata_entries)
-                .map_err(|e| Status::internal(format!("Metadata error: {}", e)))?;
+        // Build aligned vector + metadata lists (skip entries with no vector).
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(req.vectors.len());
+        let mut metadata: Vec<Vec<(String, String)>> = Vec::with_capacity(req.vectors.len());
+        for bv in &req.vectors {
+            if let Some(v) = bv.vector.as_ref() {
+                vectors.push(v.elements.clone());
+                metadata.push(bv.metadata.iter().map(|(k, val)| (k.clone(), val.clone())).collect());
+            }
         }
+
+        // Shared engine path (WAL, cosine normalization, indexing, planner, caches).
+        let start_id = collection.insert_batch(&vectors, &metadata)
+            .map_err(|e| Status::internal(format!("Insert error: {}", e)))?;
 
         Ok(Response::new(UpsertBatchResponse {
             start_id,
@@ -437,19 +411,11 @@ impl VectorService for VectorServiceImpl {
 
         let vec = req.vector.ok_or_else(|| Status::invalid_argument("Missing vector"))?;
 
-        collection.delete(req.id)
-            .map_err(|e| Status::internal(format!("{}", e)))?;
-
-        let new_id = collection.vector_store.insert(&vec.elements)
-            .map_err(|e| Status::internal(format!("{}", e)))?;
-
-        collection.indexer.insert(new_id, &vec.elements)
-            .map_err(|e| Status::internal(format!("{}", e)))?;
-
-        for (k, v) in req.metadata {
-            collection.metadata_store.insert(new_id, k, v)
-                .map_err(|e| Status::internal(format!("{}", e)))?;
-        }
+        // Shared engine path: delete + re-insert with normalization/indexing/WAL.
+        let meta: Vec<(String, String)> = req.metadata.into_iter().collect();
+        let new_id = collection.update(req.id, &vec.elements, &meta)
+            .map_err(|e| Status::internal(format!("{}", e)))?
+            .ok_or_else(|| Status::failed_precondition("Vector already deleted"))?;
 
         Ok(Response::new(UpdateResponse {
             old_id: req.id,
@@ -472,10 +438,10 @@ impl VectorService for VectorServiceImpl {
             return Err(Status::failed_precondition("Vector already deleted"));
         }
 
-        for (k, v) in req.metadata {
-            collection.metadata_store.insert(req.id, k, v)
-                .map_err(|e| Status::internal(format!("{}", e)))?;
-        }
+        // Shared engine path: updates payload index + invalidates affected caches.
+        let meta: Vec<(String, String)> = req.metadata.into_iter().collect();
+        collection.update_metadata(req.id, &meta)
+            .map_err(|e| Status::internal(format!("{}", e)))?;
 
         Ok(Response::new(UpdateMetadataResponse {
             id: req.id,

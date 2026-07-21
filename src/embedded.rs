@@ -25,15 +25,21 @@
 //! )?;
 //! ```
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::collection::{
     Collection, CollectionConfig, CollectionInfo, CollectionManager,
-    SearchParams, SearchResult,
+    SearchParams, SearchResult, SnapshotInfo, VectorEntry,
 };
 use crate::text::HybridSearchResult;
+use crate::versioning::{
+    ThreadSafeVersionedStore, VectorVersion, VersioningConfig, VersioningStats,
+};
 use crate::VecDbError;
+
+use chrono::{DateTime, Utc};
 
 /// Result type for embedded API.
 pub type Result<T> = std::result::Result<T, VecDbError>;
@@ -91,9 +97,144 @@ impl CoreVecDB {
         Ok(())
     }
 
+    // ─── Snapshots ──────────────────────────────────────────────────
+
+    /// Create a point-in-time snapshot of a collection under `_snapshots/`.
+    pub fn create_snapshot(&self, collection: &str) -> Result<SnapshotInfo> {
+        self.manager.create_snapshot(collection).map_err(Into::into)
+    }
+
+    /// List all snapshots for a collection.
+    pub fn list_snapshots(&self, collection: &str) -> Result<Vec<SnapshotInfo>> {
+        self.manager.list_snapshots(collection).map_err(Into::into)
+    }
+
+    /// Restore a snapshot into a collection.
+    ///
+    /// With `new_name = None` the snapshot's original collection name is used
+    /// (which must not already exist); pass `Some(name)` to restore under a new
+    /// name (e.g. to clone). Returns a handle to the restored collection.
+    pub fn restore_snapshot(
+        &self,
+        snapshot_name: &str,
+        new_name: Option<&str>,
+    ) -> Result<CollectionHandle> {
+        let c = self.manager.restore_snapshot(snapshot_name, new_name)?;
+        Ok(CollectionHandle { inner: c })
+    }
+
+    /// Delete a snapshot by name.
+    pub fn delete_snapshot(&self, snapshot_name: &str) -> Result<()> {
+        self.manager.delete_snapshot(snapshot_name).map_err(Into::into)
+    }
+
     /// Get the underlying CollectionManager (for advanced usage).
     pub fn manager(&self) -> &Arc<CollectionManager> {
         &self.manager
+    }
+}
+
+/// In-process vector versioning: full history, time-travel queries, and rollback.
+///
+/// This is an **independent, in-memory** store — it is not persisted to disk and
+/// is decoupled from a [`Collection`]'s vectors (the same design the HTTP
+/// `/versioned/*` endpoints use). Construct one per logical vector space and drive
+/// it explicitly; nothing in `CoreVecDB` writes to it automatically.
+///
+/// # Example
+/// ```rust,ignore
+/// use vectordb::embedded::VersionedStore;
+/// let vs = VersionedStore::new(128);
+/// let v1 = vs.upsert(0, vec![1.0; 128], &[("note", "first")], None)?;
+/// let v2 = vs.upsert(0, vec![2.0; 128], &[], Some("second edit"))?;
+/// let history = vs.history(0);              // [v1, v2]
+/// let restored = vs.rollback(0, v1.version_id)?;  // new version cloning v1
+/// ```
+#[derive(Clone)]
+pub struct VersionedStore {
+    inner: ThreadSafeVersionedStore,
+}
+
+impl VersionedStore {
+    /// Create a versioned store for `dim`-dimensional vectors (default config).
+    pub fn new(dim: usize) -> Self {
+        Self { inner: ThreadSafeVersionedStore::new(dim) }
+    }
+
+    /// Create a versioned store with a custom retention/version-cap config.
+    pub fn with_config(dim: usize, config: VersioningConfig) -> Self {
+        Self { inner: ThreadSafeVersionedStore::with_config(dim, config) }
+    }
+
+    /// Insert or update a vector, creating a new version. Optional change note.
+    pub fn upsert(
+        &self,
+        vector_id: u64,
+        vector: Vec<f32>,
+        metadata: &[(&str, &str)],
+        description: Option<&str>,
+    ) -> Result<VectorVersion> {
+        let meta: HashMap<String, String> = metadata
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        self.inner
+            .upsert_with_description(vector_id, vector, meta, description)
+            .map_err(Into::into)
+    }
+
+    /// Record a deletion as a new version.
+    pub fn delete(&self, vector_id: u64) -> Result<VectorVersion> {
+        self.inner.delete(vector_id).map_err(Into::into)
+    }
+
+    /// Get the latest (non-deleted) version of a vector.
+    pub fn get(&self, vector_id: u64) -> Option<VectorVersion> {
+        self.inner.get(vector_id)
+    }
+
+    /// Get a specific version by its version ID.
+    pub fn get_version(&self, vector_id: u64, version_id: u64) -> Option<VectorVersion> {
+        self.inner.get_version(vector_id, version_id)
+    }
+
+    /// Get the version that was active at `timestamp`.
+    pub fn get_at_timestamp(
+        &self,
+        vector_id: u64,
+        timestamp: DateTime<Utc>,
+    ) -> Option<VectorVersion> {
+        self.inner.get_at_timestamp(vector_id, timestamp)
+    }
+
+    /// Full version history for a vector, oldest first.
+    pub fn history(&self, vector_id: u64) -> Vec<VectorVersion> {
+        self.inner.get_history(vector_id)
+    }
+
+    /// All active vectors as they existed at `timestamp`.
+    pub fn snapshot_at(&self, timestamp: DateTime<Utc>) -> Vec<VectorVersion> {
+        self.inner.snapshot_at(timestamp)
+    }
+
+    /// Roll a vector back to an earlier version (creates a new version).
+    pub fn rollback(&self, vector_id: u64, to_version_id: u64) -> Result<VectorVersion> {
+        self.inner.rollback(vector_id, to_version_id).map_err(Into::into)
+    }
+
+    /// Statistics across all versioned vectors.
+    pub fn stats(&self) -> VersioningStats {
+        self.inner.stats()
+    }
+
+    /// Compact old versions per the retention config. Returns versions removed.
+    pub fn compact(&self) -> usize {
+        self.inner.compact().versions_removed
+    }
+
+    /// Vector dimension.
+    pub fn dim(&self) -> usize {
+        self.inner.dim()
     }
 }
 
@@ -184,8 +325,13 @@ impl EmbeddingDB {
     }
 
     /// Create a collection with the embedder's dimension.
+    ///
+    /// Defaults to cosine distance: transformer sentence/text embeddings are
+    /// direction-based, so cosine is almost always the right metric here (the
+    /// generic `CoreVecDB::create_collection` still defaults to euclidean). Use
+    /// `create_collection_with_config` to override.
     pub fn create_collection(&self, name: &str) -> Result<()> {
-        let config = CollectionConfig::new(name, self.dimension());
+        let config = CollectionConfig::new(name, self.dimension()).with_distance("cosine");
         self.db.create_collection(config)
     }
 
@@ -361,6 +507,52 @@ impl CollectionHandle {
         self.inner.hybrid_search(vector, query, k, 0.5, true).map_err(Into::into)
     }
 
+    /// Fetch a vector and its metadata by ID.
+    ///
+    /// Returns `None` if the ID is out of range or has been soft-deleted.
+    pub fn get(&self, id: u64) -> Option<VectorEntry> {
+        self.inner.get(id)
+    }
+
+    /// Replace a vector (and metadata). Storage is append-only, so this returns a
+    /// NEW id; the old id is soft-deleted.
+    ///
+    /// Errors with [`VecDbError::NotFound`] if `old_id` is out of range or deleted.
+    pub fn update(
+        &self,
+        old_id: u64,
+        vector: &[f32],
+        metadata: &[(&str, &str)],
+    ) -> Result<u64> {
+        let meta: Vec<(String, String)> = metadata
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        self.inner
+            .update(old_id, vector, &meta)?
+            .ok_or_else(|| VecDbError::NotFound(format!("vector {old_id}")))
+    }
+
+    /// Overwrite metadata keys for an existing vector (vector and ID unchanged).
+    ///
+    /// Errors with [`VecDbError::NotFound`] if `id` is out of range or deleted.
+    pub fn update_metadata(&self, id: u64, metadata: &[(&str, &str)]) -> Result<()> {
+        let meta: Vec<(String, String)> = metadata
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        if self.inner.update_metadata(id, &meta)? {
+            Ok(())
+        } else {
+            Err(VecDbError::NotFound(format!("vector {id}")))
+        }
+    }
+
+    /// Text-only BM25 search (requires the collection to have `text_fields`).
+    pub fn text_search(&self, query: &str, k: usize) -> Result<Vec<crate::text::TextSearchResult>> {
+        self.inner.text_search(query, k).map_err(Into::into)
+    }
+
     /// Delete a vector by ID.
     pub fn delete(&self, id: u64) -> Result<bool> {
         self.inner.delete(id).map_err(Into::into)
@@ -371,14 +563,27 @@ impl CollectionHandle {
         self.inner.delete_batch(ids).map_err(Into::into)
     }
 
-    /// Get total vector count (including deleted).
+    /// Get the number of active (non-deleted) vectors.
+    ///
+    /// This is what most callers mean by "how many vectors are in here" — it
+    /// excludes soft-deleted tombstones.
     pub fn len(&self) -> usize {
+        self.inner.active_count()
+    }
+
+    /// Get the total number of vectors ever inserted, including soft-deleted ones.
+    pub fn total_len(&self) -> usize {
         self.inner.len()
     }
 
-    /// Check if collection is empty.
+    /// Get the number of soft-deleted vectors.
+    pub fn deleted_len(&self) -> usize {
+        self.inner.deleted_count()
+    }
+
+    /// Check if the collection has no active vectors.
     pub fn is_empty(&self) -> bool {
-        self.inner.len() == 0
+        self.inner.active_count() == 0
     }
 
     /// Get collection info.
@@ -394,5 +599,74 @@ impl CollectionHandle {
     /// Get the underlying Collection (for advanced usage).
     pub fn inner(&self) -> &Arc<Collection> {
         &self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = env::temp_dir().join(format!("corevecdb_embed_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn test_snapshot_create_list_delete() {
+        let dir = tmp("snapshot");
+        let db = CoreVecDB::open(&dir).unwrap();
+        db.create_collection(CollectionConfig::new("docs", 4)).unwrap();
+        let col = db.collection("docs").unwrap();
+        col.insert(&[1.0; 4], &[("k", "v")]).unwrap();
+        col.flush().unwrap();
+
+        let snap = db.create_snapshot("docs").unwrap();
+        assert_eq!(snap.collection, "docs");
+
+        let list = db.list_snapshots("docs").unwrap();
+        assert!(list.iter().any(|s| s.name == snap.name));
+
+        // Restore under a new name → independent collection with the same data.
+        let restored = db.restore_snapshot(&snap.name, Some("docs_copy")).unwrap();
+        assert_eq!(restored.len(), 1);
+
+        db.delete_snapshot(&snap.name).unwrap();
+        assert!(db.list_snapshots("docs").unwrap().iter().all(|s| s.name != snap.name));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_versioning_history_and_rollback() {
+        let vs = VersionedStore::new(4);
+        let v1 = vs.upsert(0, vec![1.0; 4], &[("note", "first")], None).unwrap();
+        let v2 = vs.upsert(0, vec![2.0; 4], &[], Some("second edit")).unwrap();
+        assert_ne!(v1.version_id, v2.version_id);
+
+        // History keeps both; latest is v2.
+        assert_eq!(vs.history(0).len(), 2);
+        assert_eq!(vs.get(0).unwrap().version_id, v2.version_id);
+
+        // Fetch an old version explicitly.
+        assert_eq!(vs.get_version(0, v1.version_id).unwrap().vector, vec![1.0; 4]);
+
+        // Rollback creates a NEW version cloning v1's content.
+        vs.rollback(0, v1.version_id).unwrap();
+        assert_eq!(vs.get(0).unwrap().vector, vec![1.0; 4]);
+
+        let stats = vs.stats();
+        assert_eq!(stats.active_vectors, 1);
+        assert!(stats.total_versions >= 3);
+    }
+
+    #[test]
+    fn test_versioning_delete_marks_inactive() {
+        let vs = VersionedStore::new(2);
+        vs.upsert(7, vec![0.5, 0.5], &[], None).unwrap();
+        vs.delete(7).unwrap();
+        assert!(vs.get(7).map_or(true, |v| v.is_deleted));
+        assert_eq!(vs.stats().active_vectors, 0);
     }
 }

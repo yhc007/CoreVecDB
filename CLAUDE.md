@@ -5,20 +5,89 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build and Run Commands
 
 ```bash
-# Build (release)
+# Build (release) — default `server` feature: builds the `vectordb` binary,
+# compiling protobuf definitions via build.rs
 cargo build --release
 
-# Run the server (uses config.toml)
+# Run the server (binds gRPC + HTTP, uses config.toml)
 cargo run --release
 
-# Build only (compiles protobuf definitions via build.rs)
-cargo build
+# Run Rust unit tests (tests are inline #[cfg(test)] modules, no tests/ dir)
+cargo test
 
-# Test client (requires server running)
-python test_client.py
+# Run a single test by name substring
+cargo test <test_name>
 
-# Run benchmark
-python benchmark.py
+# Test/lint hygiene
+cargo clippy --all-targets
+cargo fmt
+
+# Candle GPU/ML benchmark (requires the ../candle-embed sibling crate; see below)
+cargo bench --bench candle_gpu_bench --features candle --no-default-features
+
+# Python integration tests / benchmarks (require the server running first)
+python test_client.py          # smoke test
+python benchmark.py            # basic throughput benchmark
+python benchmark_full.py       # full benchmark incl. payload index
+python bench_competitive.py    # vs other vector DBs
+```
+
+The `test_*.py` scripts at the repo root are HTTP integration tests that hit a
+**running server** — start `cargo run --release` before running them. They are
+not part of `cargo test`.
+
+## Cargo Features & Deployment Modes
+
+This crate has three distinct ways it gets consumed, gated by Cargo features
+(`Cargo.toml`):
+
+| Feature | Default | What it enables |
+|---------|---------|-----------------|
+| `server` | ✅ yes | Axum HTTP + Tonic gRPC servers, protobuf build (`build.rs`). Required for the `vectordb` binary. |
+| `candle` | no | In-process transformer embeddings + Candle-tensor GPU distance/K-Means. Pulls the **`../candle-embed` sibling crate** (path dep) and `candle-core`. |
+| `candle-metal` | no | `candle` on Apple GPU (Metal). |
+| `candle-cuda` | no | `candle` on NVIDIA GPU (CUDA). |
+
+**Important build notes:**
+- `build.rs` only compiles the `.proto` file under the `server` feature. Building
+  with `--no-default-features` (e.g. for embedded/library use) skips gRPC entirely.
+- The `candle` feature depends on `candle-embed` at `../candle-embed` (a **sibling
+  directory, not vendored here**). If that crate is absent, any `--features candle`
+  build fails to resolve the path dependency. All Candle code is `#[cfg(feature = "candle")]`-gated so default builds are unaffected.
+
+### Deployment mode 1 — Server (HTTP + gRPC)
+Default. `cargo run --release` starts `src/main.rs`, which wires up all layers and
+serves the HTTP API (port 3000) and gRPC (port 50051). This is what all the API
+docs below describe.
+
+### Deployment mode 2 — Embedded (in-process Rust library)
+`src/embedded.rs` exposes `CoreVecDB`, an ergonomic in-process wrapper over
+`CollectionManager` with **zero network overhead**. Errors surface as the crate-level
+`VecDbError` enum (`src/lib.rs`) rather than HTTP status codes. When built with
+`--features candle`, `EmbeddingDB` adds an in-process `CandleTextEmbedder` so callers
+can insert/search by raw text (text → vector happens locally).
+
+```rust
+use vectordb::embedded::CoreVecDB;
+use vectordb::collection::{CollectionConfig, SearchParams};
+
+let db = CoreVecDB::open("./my_data")?;
+db.create_collection(CollectionConfig::new("products", 128).with_distance("cosine"))?;
+let col = db.collection("products")?;
+let id = col.insert(&[0.1; 128], &[("category", "electronics")])?;
+let results = col.search(SearchParams::new(vec![0.1; 128], 10).with_metadata())?;
+```
+
+### Deployment mode 3 — Python bindings (`corevecdb-python/`)
+A separate PyO3/maturin crate (`corevecdb`) that wraps `vectordb::embedded::CoreVecDB`
+with `default-features = false` (no server). Exposes `CoreVecDB`, `CollectionHandle`,
+and text methods (`insert_text`/`search_text`/`hybrid_search_text`) that take an
+`EmbeddingDB`.
+
+```bash
+cd corevecdb-python
+maturin develop --release          # build + install into current venv
+maturin develop --release --features candle   # with in-process embeddings
 ```
 
 ## Architecture Overview
@@ -94,7 +163,22 @@ VectorDB is a Rust-based vector database with HNSW indexing, exposing both gRPC 
 
 11. **Proto** (`src/proto/vectordb.proto`)
    - Defines `VectorService` with `Upsert`, `Search`, `Get`, `HybridSearch`, `TextSearch` RPCs
-   - Compiled via `tonic-build` in `build.rs`
+   - Compiled via `tonic-build` in `build.rs` (only under the `server` feature)
+
+12. **Replication** (`src/replication/mod.rs`)
+    - Primary-Replica architecture (`ReplicationRole`: `Primary`, `Replica`, `Standalone`)
+    - Replicas sync from the primary via WAL streaming + snapshot-based initial sync
+    - Replicas are read-only; primary accepts writes
+
+13. **Metrics** (`src/metrics/mod.rs`)
+    - Prometheus metrics (via `prometheus` + `lazy_static`), exposed at `GET /metrics`
+
+14. **Embedded** (`src/embedded.rs`) — `CoreVecDB` in-process API and (feature-gated)
+    `EmbeddingDB` text-embedding wrapper. See "Deployment mode 2" above.
+
+15. **GPU / Candle** (`src/gpu/mod.rs`) — batch distance + K-Means. Auto-selects
+    Metal → CUDA → SIMD-CPU. Candle-tensor paths are `#[cfg(feature = "candle")]`;
+    without the feature it falls back to SIMD. See the "GPU Acceleration" section below.
 
 ### Request Flow
 

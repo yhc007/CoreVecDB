@@ -660,16 +660,11 @@ async fn collection_upsert(
     let collection = state.manager.get(&name)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let internal_id = collection.vector_store.insert(&payload.vector)
+    // Shared engine path: applies cosine normalization, text/payload indexing,
+    // WAL logging, query-planner stats, and cache invalidation.
+    let meta: Vec<(String, String)> = payload.metadata.into_iter().collect();
+    let internal_id = collection.insert(&payload.vector, &meta)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    collection.indexer.insert(internal_id, &payload.vector)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    for (k, v) in payload.metadata {
-        collection.metadata_store.insert(internal_id, k, v)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
 
     Ok(Json(serde_json::json!({
         "id": internal_id,
@@ -702,40 +697,16 @@ async fn collection_upsert_batch(
         .map(|v| v.vector.clone())
         .collect();
 
-    // Batch insert to vector store
-    let start_id = collection.vector_store.insert_batch(&vectors)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Prepare index data: (id, vector)
-    let index_data: Vec<(u64, Vec<f32>)> = vectors
-        .into_iter()
-        .enumerate()
-        .map(|(i, v)| (start_id + i as u64, v))
-        .collect();
-
-    // Batch insert to HNSW index
-    collection.indexer.insert_batch(&index_data)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Collect metadata entries
-    let metadata_entries: Vec<MetadataEntry> = payload.vectors
+    // Per-vector metadata as (key, value) pairs, in the same order as `vectors`.
+    let metadata: Vec<Vec<(String, String)>> = payload.vectors
         .iter()
-        .enumerate()
-        .flat_map(|(i, v)| {
-            let id = start_id + i as u64;
-            v.metadata.iter().map(move |(k, val)| MetadataEntry {
-                id,
-                key: k.clone(),
-                value: val.clone(),
-            })
-        })
+        .map(|v| v.metadata.iter().map(|(k, val)| (k.clone(), val.clone())).collect())
         .collect();
 
-    // Batch insert metadata
-    if !metadata_entries.is_empty() {
-        collection.metadata_store.insert_batch(&metadata_entries)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
+    // Shared engine path: WAL batch, cosine normalization, HNSW batch insert,
+    // text/payload indexing, planner stats, and cache invalidation.
+    let start_id = collection.insert_batch(&vectors, &metadata)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(JsonBatchUpsertResp {
         start_id,
@@ -1851,7 +1822,7 @@ async fn collection_update_vector(
     let collection = state.manager.get(&name)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Check if vector exists and not already deleted
+    // Distinguish 404 (never existed) from 410 (soft-deleted) for the caller.
     if old_id as usize >= collection.len() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -1859,23 +1830,12 @@ async fn collection_update_vector(
         return Err(StatusCode::GONE);
     }
 
-    // Delete old vector
-    collection.delete(old_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Insert new vector
-    let new_id = collection.vector_store.insert(&payload.vector)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Index new vector
-    collection.indexer.insert(new_id, &payload.vector)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Insert metadata
-    for (k, v) in payload.metadata {
-        collection.metadata_store.insert(new_id, k, v)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
+    // Shared engine path: delete + re-insert, so cosine normalization, text/payload
+    // indexing, WAL, and cache invalidation all apply.
+    let meta: Vec<(String, String)> = payload.metadata.into_iter().collect();
+    let new_id = collection.update(old_id, &payload.vector, &meta)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::GONE)?;
 
     Ok(Json(serde_json::json!({
         "old_id": old_id,
@@ -1894,7 +1854,7 @@ async fn collection_update_metadata(
     let collection = state.manager.get(&name)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Check if vector exists and not deleted
+    // Distinguish 404 (never existed) from 410 (soft-deleted) for the caller.
     if id as usize >= collection.len() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -1902,10 +1862,12 @@ async fn collection_update_metadata(
         return Err(StatusCode::GONE);
     }
 
-    // Update metadata (overwrites existing keys)
-    for (k, v) in payload.metadata {
-        collection.metadata_store.insert(id, k, v)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Shared engine path: updates payload index + invalidates affected caches.
+    let meta: Vec<(String, String)> = payload.metadata.into_iter().collect();
+    let updated = collection.update_metadata(id, &meta)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !updated {
+        return Err(StatusCode::GONE);
     }
 
     Ok(Json(serde_json::json!({

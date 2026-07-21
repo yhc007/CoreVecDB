@@ -341,6 +341,17 @@ pub struct SearchResult {
     pub metadata: Option<HashMap<String, String>>,
 }
 
+/// A stored vector with its metadata, as returned by [`Collection::get`].
+#[derive(Debug, Clone)]
+pub struct VectorEntry {
+    /// Vector ID
+    pub id: u64,
+    /// Stored vector values (unit-normalized for cosine collections)
+    pub vector: Vec<f32>,
+    /// All metadata key/value pairs for this vector
+    pub metadata: HashMap<String, String>,
+}
+
 /// A single collection containing vectors, index, and metadata.
 pub struct Collection {
     /// Configuration
@@ -643,9 +654,28 @@ impl Collection {
         self.deleted_ids.read().contains(id as u32)
     }
 
+    /// Normalize a vector to unit length when the collection uses cosine distance.
+    ///
+    /// Cosine distance is scale-invariant, so this does not change ranking, but it
+    /// keeps every downstream path consistent: the HNSW `DistCosine`, the SIMD
+    /// brute-force path, and (crucially) the quantized ADC path — which compares
+    /// on L2 over the stored bytes and therefore *does* depend on unit-length input.
+    /// For euclidean/dot-product collections the input is returned unchanged.
+    fn prepare_vector<'a>(&self, vector: &'a [f32]) -> std::borrow::Cow<'a, [f32]> {
+        if self.config.distance_metric() == DistanceMetric::Cosine {
+            std::borrow::Cow::Owned(crate::simd::normalize(vector))
+        } else {
+            std::borrow::Cow::Borrowed(vector)
+        }
+    }
+
     /// Insert a vector with metadata.
     /// Writes to WAL first for durability, then applies to storage and index.
     pub fn insert(&self, vector: &[f32], metadata: &[(String, String)]) -> Result<u64> {
+        // Normalize up front (cosine only) so the WAL, store, and index all agree.
+        let prepared = self.prepare_vector(vector);
+        let vector = prepared.as_ref();
+
         // Write to WAL first
         if let Some(ref wal) = self.wal {
             wal.append(WalOperation::Insert {
@@ -699,6 +729,16 @@ impl Collection {
             return Ok(self.vector_store.len() as u64);
         }
 
+        // Normalize up front (cosine only). Bind `vectors` to the normalized copy
+        // so the WAL, store, and index all see the same unit-length vectors.
+        let normalized_storage: Vec<Vec<f32>>;
+        let vectors: &[Vec<f32>] = if self.config.distance_metric() == DistanceMetric::Cosine {
+            normalized_storage = vectors.iter().map(|v| crate::simd::normalize(v)).collect();
+            &normalized_storage
+        } else {
+            vectors
+        };
+
         // Write to WAL first
         if let Some(ref wal) = self.wal {
             wal.append(WalOperation::BatchInsert {
@@ -751,6 +791,66 @@ impl Collection {
         self.invalidate_query_cache();
 
         Ok(start_id)
+    }
+
+    /// Fetch a vector and its metadata by ID.
+    ///
+    /// Returns `None` if the ID is out of range or has been soft-deleted. This is
+    /// the shared implementation behind the HTTP `GET /vectors/:id`, the gRPC `Get`
+    /// RPC, and the embedded/Python `get()`.
+    pub fn get(&self, id: u64) -> Option<VectorEntry> {
+        if id as usize >= self.vector_store.len() || self.is_deleted(id) {
+            return None;
+        }
+        let vector = self.vector_store.get(id).ok()?;
+        let metadata = self.metadata_store.get_all(id);
+        Some(VectorEntry { id, vector, metadata })
+    }
+
+    /// Replace a vector (and its metadata) with new content.
+    ///
+    /// Storage is append-only, so this soft-deletes `old_id` and inserts the new
+    /// vector under a fresh ID (returned in `Ok(Some(new_id))`). Returns `Ok(None)`
+    /// if `old_id` is out of range or already deleted.
+    ///
+    /// Routes the insert through [`Collection::insert`], so cosine normalization,
+    /// text/payload indexing, WAL logging, and cache invalidation all apply —
+    /// unlike a manual store+index write.
+    pub fn update(
+        &self,
+        old_id: u64,
+        vector: &[f32],
+        metadata: &[(String, String)],
+    ) -> Result<Option<u64>> {
+        if old_id as usize >= self.vector_store.len() || self.is_deleted(old_id) {
+            return Ok(None);
+        }
+        self.delete(old_id)?;
+        let new_id = self.insert(vector, metadata)?;
+        Ok(Some(new_id))
+    }
+
+    /// Overwrite metadata keys for an existing vector without changing the vector
+    /// or its ID.
+    ///
+    /// Keys absent from `metadata` are left untouched (merge semantics, matching
+    /// the HTTP `PATCH`). Returns `Ok(false)` if the ID is out of range or deleted.
+    /// Updates the payload index (via the metadata store) and invalidates the
+    /// affected filter/query caches.
+    ///
+    /// Note: changing an *indexed* field's value adds the new value to the payload
+    /// index but does not retract the old value's posting — a pre-existing engine
+    /// limitation shared with the HTTP handler.
+    pub fn update_metadata(&self, id: u64, metadata: &[(String, String)]) -> Result<bool> {
+        if id as usize >= self.vector_store.len() || self.is_deleted(id) {
+            return Ok(false);
+        }
+        for (k, v) in metadata {
+            self.metadata_store.insert(id, k.clone(), v.clone())?;
+            self.invalidate_filter_cache_field(k);
+        }
+        self.invalidate_query_cache();
+        Ok(true)
     }
 
     /// Delete a vector by ID (soft delete).
@@ -1078,11 +1178,15 @@ impl Collection {
             );
         }
 
+        // Normalize the query too (cosine only) so it matches the stored vectors.
+        let query = self.prepare_vector(&params.vector);
+        let query = query.as_ref();
+
         // Execute search — use Arc reference directly if no other filters were applied
         let results = if let Some(ref arc_bm) = cached_bitmap_arc {
-            self.adaptive_search(&params.vector, params.k, Some(arc_bm.as_ref()))?
+            self.adaptive_search(query, params.k, Some(arc_bm.as_ref()))?
         } else {
-            self.adaptive_search(&params.vector, params.k, filter_bitmap.as_ref())?
+            self.adaptive_search(query, params.k, filter_bitmap.as_ref())?
         };
 
         // Post-filter + build results
@@ -1787,6 +1891,20 @@ pub struct CollectionManager {
     default_collection: String,
 }
 
+impl Drop for CollectionManager {
+    /// Flush all collections when the manager is dropped.
+    ///
+    /// The storage layer batches writes (256-vector write buffer), so callers
+    /// that forget an explicit `flush()` would otherwise lose buffered inserts on
+    /// process exit. This is the safety net for embedded/Python users; the server
+    /// still flushes explicitly on shutdown (a second flush is a harmless no-op).
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_all() {
+            eprintln!("CollectionManager flush on drop failed: {:?}", e);
+        }
+    }
+}
+
 impl CollectionManager {
     /// Create a new collection manager.
     pub fn new(base_dir: &Path) -> Result<Self> {
@@ -2342,6 +2460,89 @@ mod tests {
         for r in &results {
             assert_ne!(r.id, 0, "deleted vector should not appear");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cosine_collection_ranks_by_direction() {
+        // Cosine is direction-based: a long vector pointing the same way as the
+        // query must beat a short vector pointing elsewhere. This exercises the
+        // insert/search normalization path (unnormalized input, cosine metric).
+        let dir = test_dir("cosine_direction");
+        let config = CollectionConfig::new("cos", 4).with_distance("cosine");
+        let col = Arc::new(Collection::open(&dir, config).unwrap());
+
+        // id 0: same direction as query, large magnitude
+        col.insert(&[10.0, 0.0, 0.0, 0.0], &[]).unwrap();
+        // id 1: orthogonal direction, small magnitude
+        col.insert(&[0.0, 0.1, 0.0, 0.0], &[]).unwrap();
+
+        let results = col
+            .search(SearchParams::new(vec![1.0, 0.0, 0.0, 0.0], 2))
+            .unwrap();
+
+        assert_eq!(results[0].id, 0, "same-direction vector should rank first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_get_returns_vector_and_metadata() {
+        let (dir, col) = setup_search_collection("get_entry");
+        let entry = col.get(0).expect("id 0 should exist");
+        assert_eq!(entry.id, 0);
+        assert_eq!(entry.vector.len(), 4);
+        assert_eq!(entry.metadata.get("category").unwrap(), "electronics");
+        // Deleted / out-of-range → None
+        col.delete(0).unwrap();
+        assert!(col.get(0).is_none(), "deleted id should return None");
+        assert!(col.get(999).is_none(), "out-of-range id should return None");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_replaces_vector_with_new_id() {
+        let (dir, col) = setup_search_collection("update_vec");
+        let new_id = col
+            .update(1, &[9.0; 4], &[("category".to_string(), "books".to_string())])
+            .unwrap()
+            .expect("update should succeed for a live id");
+        assert!(new_id >= 5, "append-only update should mint a fresh id");
+        assert!(col.get(1).is_none(), "old id should be soft-deleted");
+        let moved = col.get(new_id).expect("new id should exist");
+        assert_eq!(moved.metadata.get("category").unwrap(), "books");
+        // Updating a deleted id → Ok(None)
+        assert!(col.update(1, &[0.0; 4], &[]).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_metadata_merges_keys() {
+        let (dir, col) = setup_search_collection("update_meta");
+        assert!(col
+            .update_metadata(2, &[("on_sale".to_string(), "true".to_string())])
+            .unwrap());
+        let entry = col.get(2).unwrap();
+        assert_eq!(entry.metadata.get("on_sale").unwrap(), "true");
+        // Original key preserved (merge, not replace)
+        assert_eq!(entry.metadata.get("category").unwrap(), "books");
+        // Deleted id → Ok(false)
+        col.delete(2).unwrap();
+        assert!(!col
+            .update_metadata(2, &[("x".to_string(), "y".to_string())])
+            .unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_len_excludes_deleted_via_active_count() {
+        // active_count must drop after a delete even though total len is unchanged.
+        let (dir, col) = setup_search_collection("len_active");
+        assert_eq!(col.active_count(), 5);
+        assert_eq!(col.deleted_count(), 0);
+        col.delete(0).unwrap();
+        assert_eq!(col.active_count(), 4, "active count should exclude deleted");
+        assert_eq!(col.deleted_count(), 1);
+        assert_eq!(col.len(), 5, "raw len still counts the tombstone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
